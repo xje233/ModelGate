@@ -48,6 +48,33 @@ curl -s localhost:8080/v1/chat/completions \
 # 响应头 x-modelgate-attempted: mock-broken,mock-b 显示完整失败链
 ```
 
+## IDE 报红怎么办（先看这里）
+
+现象：`Missing artifact io.modelgate:modelgate-xxx:jar:0.1.0-SNAPSHOT`、`Maven Dependencies
+references non existing library ...`，随后整片 `cannot be resolved`。
+
+原因：**IDE 是按本地仓库解析模块间依赖的**。当新增了一个模块（比如 W2 的 `modelgate-quota`、
+W3 的 `modelgate-cache` / `modelgate-testkit`），在它被 `install` 到本地仓库、且 IDE 重新导入
+Maven 工程之前，IDE 会一直抱着"这个 jar 不存在"的旧结论并级联报红。
+
+处置（两步）：
+
+```bash
+# 1. 让依赖真正落到本地仓库（package 不够，必须是 install）
+mvn -s maven-settings.xml clean install
+
+# 2. 让 IDE 重新解析
+#    IntelliJ IDEA：Maven 面板 → 🔄 Reload All Maven Projects（必要时再 Build → Rebuild Project）
+#    Eclipse / m2e：项目右键 → Maven → Update Project（Alt+F5），勾选 Force Update
+```
+
+判断"到底是代码问题还是 IDE 缓存问题"，用这条命令即可：
+**不带 `-am`、纯离线**地单独构建某个模块，它能过就说明本地仓库解析链路是通的。
+
+```bash
+mvn -s maven-settings.xml -o -pl modelgate-proxy clean package -DskipTests
+```
+
 ## 路由与熔断
 
 | 机制 | 范围 | 触发 |
