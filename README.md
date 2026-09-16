@@ -1,22 +1,62 @@
 # ModelGate
 
-面向大模型调用的统一接入与流量治理网关：多模型路由 / 多维配额 / 语义缓存 / 熔断降级 / 成本核算。
-实施计划见 [plan.md](plan.md)；压测报告 [W2](loadtest/RESULTS.md) · [W3](loadtest/RESULTS-W3.md)；
-功能验证记录 [verify/W3-verification.md](verify/W3-verification.md)。
+面向大模型调用的统一接入与流量治理网关：多模型路由 / 灰度分流 / 多维配额 / 语义缓存 /
+熔断降级 / 用量与成本核算。
+
+- 实施计划：[plan.md](plan.md)
+- 压测报告：[W2](loadtest/RESULTS.md) · [W3（JVM 对照）](loadtest/RESULTS-W3.md)
+- 功能验证：[W3](verify/W3-verification.md) · [W4](verify/W4-verification.md)
+- 面试话术：[docs/interview-narrative.md](docs/interview-narrative.md)
 
 ## 模块
 
 ```
 modelgate-core        canonical OpenAI 格式类型（零依赖，全系统唯一数据契约）
 modelgate-providers   Provider SPI + OpenAI 兼容泛化实现（chat + embeddings）
-modelgate-router      加权路由 + retry(组内) / fallback(跨组) / 熔断 CLOSED-OPEN-HALF_OPEN
+modelgate-router      加权路由 / 灰度分桶 / retry(组内) / fallback(跨组) / 熔断状态机
 modelgate-quota       三层配额（key / tenant / model）：进程内 与 Redis+Lua 双后端
 modelgate-cache       语义缓存：余弦检索 + 进程内/Redis 双后端 + 嵌入缓存 + in-flight 合并
-modelgate-client      WebClient 传输 + SSE 解析 + 超时归一 + 成本计算
-modelgate-mock        Mock 上游（延迟 / 逐帧 pacing / 注错 / 确定性 embedding）
+modelgate-usage       用量与成本：有界队列 + 异步批量落库 + 多维聚合
+modelgate-client      WebClient 传输 + SSE 解析 + 超时归一 + 成本/缓存计价
+modelgate-mock        Mock 上游（延迟 / 逐帧 pacing / 注错 / 确定性 embedding / 模拟 prompt cache）
 modelgate-proxy       Spring Boot WebFlux 网关（对外交付形态）
 modelgate-testkit     测试基建（一次性 redis-server 等）
 ```
+
+## 架构与请求链路
+
+```mermaid
+flowchart LR
+    C[OpenAI 兼容客户端] -->|Bearer sk-xxx| F
+
+    subgraph GW[modelgate-proxy / WebFlux]
+        F[鉴权 + 身份解析] --> G[配额守卫<br/>key→tenant→model]
+        G --> AR[路由臂选择<br/>canary/stable]
+        AR --> SC{语义缓存}
+        SC -->|命中| RESP[写响应]
+        SC -->|未命中| RT[Router 选路<br/>加权 / 灰度]
+        RT --> MG[GatewayService<br/>retry→fallback→熔断]
+        MG --> RESP
+        MG --> UD[(用量收据<br/>有界队列)]
+    end
+
+    MG -->|SSE 透传| P1
+    P1[modelgate-providers<br/>OpenAI 兼容] --> UP1[(上游 A)]
+    P1 --> UP2[(上游 B / 备用组)]
+
+    UD -.批量写入.-> DB[(t_usage_log / 内存)]
+    SC -.-> RD[(Redis<br/>向量 + 计数器)]
+    G -.-> RD
+    GW --> M[/actuator/prometheus/]
+    GW --> AD[/admin/usage/]
+```
+
+一次非流式请求的顺序：**鉴权 → 配额三层校验 → 定臂 → 语义缓存探测 → 路由（retry/fallback/熔断）
+→ 写响应 → 异步记账**。流式请求跳过缓存（要等答案全部生成才知道重复，那时 token 已经花了），
+逐帧 flush 透传。
+
+依赖方向是单向的：`core ← providers ← client ← proxy`，`router`/`quota`/`cache`/`usage` 只依赖 `core`，
+所以路由、配额、缓存、计量四块逻辑都能脱离 HTTP 单独单测。
 
 ## 构建与运行
 
@@ -89,6 +129,29 @@ mvn -s maven-settings.xml -o -pl modelgate-proxy clean package -DskipTests
 
 流式请求的 failover 只发生在**首个 chunk 之前**——已有字节到达客户端就不再重试，否则会重复输出。
 
+## 灰度分流（canary / A-B）
+
+按**调用方（API key）哈希分桶**决定臂，同一调用方永远落在同一臂——否则灰度期间用户会在两个变体之间
+来回跳，数据既无法归因也会被用户察觉。响应头回 `x-modelgate-arm`，用量表里也记臂。
+
+```yaml
+modelgate:
+  router:
+    groups:
+      ab-test:
+        canary-deployment: mock-ab-canary   # 实验臂由哪个 deployment 承载
+        canary-percentage: 30               # 30% 的调用方
+        deployments:
+          - { name: mock-ab-stable, model-id: mock-fast-a, base-url: http://127.0.0.1:9001, weight: 10 }
+          - { name: mock-ab-canary, model-id: mock-fast-b, base-url: http://127.0.0.1:9002, weight: 10 }
+```
+
+stable 臂不会给 canary 部署分流量；canary 部署被熔断时，连实验臂的调用方也会回落到稳定池。
+
+⚠️ **分桶必须做哈希雪崩**：`String.hashCode()` 对顺序发放的 id（`key-a`、`key-b`…）是连续值，
+直接取模会让整批调用方一起进同一臂（实测 `key-a`..`key-s` 在 30% 阈值下占 73%）。
+实现里先过一遍 MurmurHash3 的 32 位 finalizer，仍保持跨 JVM / 跨副本确定。
+
 ## 语义缓存
 
 ```
@@ -128,6 +191,40 @@ modelgate:
   quota:
     backend: memory     # memory = 单实例；redis = 多实例共享计数
 ```
+
+## 用量与成本
+
+每次请求落一条收据（requestId / key / tenant / 模型 / token / 缓存命中 / 路由臂 / 尝试链 /
+TTFT / 成本）。热路径只做一次 `offer` 入有界队列，后台线程批量写库：
+**一个慢的数据库永远不能让一次推理变慢**，代价是账单最终一致、队列打满会丢记录——
+所以 `dropped`（服务了但没收到钱）是最该告警的指标。
+
+```yaml
+modelgate:
+  usage:
+    backend: memory        # memory | jdbc
+    queue-capacity: 20000  # 打满即丢，绝不阻塞请求
+    batch-size: 500
+    flush-interval-millis: 1000
+```
+
+成本不能简单按 tokens × 单价：**prompt cache 的命中与写入倍率不同**（OpenAI 命中 0.5×、写入 2×；
+Anthropic 两边 1.25×），所以 `usage.prompt_tokens_details` 在网关层解析并计价——
+实测同一段 ~1000 token 的 prompt，命中 90% 的臂成本 `0.000097`，另一臂 `0.000164`。
+
+```bash
+# 按维度聚合：DATE / TENANT / MODEL / KEY / ARM（ARM = 灰度归因）
+curl -s "localhost:8080/admin/usage?dimension=ARM&from=2026-09-16&to=2026-09-16" \
+  -H "Authorization: Bearer sk-local-test-1"
+curl -s localhost:8080/admin/usage/stats -H "Authorization: Bearer sk-local-test-1"
+
+# jdbc 后端（本地用 H2，同一套 SQL；生产换 MySQL 的 URL/驱动即可）
+java -jar modelgate-proxy-*.jar --modelgate.usage.backend=jdbc \
+  --spring.sql.init.mode=always \
+  --spring.sql.init.schema-locations=classpath:db/schema-h2.sql
+```
+
+生产 DDL（含 `t_tenant` / `t_api_key` / `t_model` 控制面）见 [ops/sql/schema.sql](ops/sql/schema.sql)。
 
 ## 可观测性
 
@@ -172,5 +269,6 @@ loadtest/stats.sh /tmp/gateway.jtl      # 输出 QPS / P50 / P95 / P99 / 错误�
 | `x-modelgate-attempted` | 完整尝试链 |
 | `x-modelgate-cost` | 本次调用成本（USD，按价目表计算） |
 | `x-modelgate-cache` / `x-modelgate-cache-similarity` | `hit` / `miss` 与相似度 |
+| `x-modelgate-arm` | 本次请求的路由臂：`canary` / `stable` / `single` |
 | `x-ratelimit-remaining-requests` | 当前窗口剩余请求数 |
 | `Retry-After` / `x-ratelimit-scope` | 仅 429 时出现 |

@@ -24,6 +24,7 @@
     <module>modelgate-router</module>
     <module>modelgate-quota</module>
     <module>modelgate-cache</module>
+    <module>modelgate-usage</module>
     <module>modelgate-client</module>
     <module>modelgate-mock</module>
     <module>modelgate-proxy</module>

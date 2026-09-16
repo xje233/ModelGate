@@ -38,12 +38,34 @@ public class RouterProperties {
     public static class GroupConfig {
         private List<DeploymentConfig> deployments = new ArrayList<>();
 
+        /** when set, the group runs a canary: this deployment serves the experimental arm */
+        private String canaryDeployment;
+
+        /** share of callers (0-100) bucketed into the canary arm */
+        private int canaryPercentage;
+
         public List<DeploymentConfig> getDeployments() {
             return deployments;
         }
 
         public void setDeployments(List<DeploymentConfig> deployments) {
             this.deployments = deployments;
+        }
+
+        public String getCanaryDeployment() {
+            return canaryDeployment;
+        }
+
+        public void setCanaryDeployment(String canaryDeployment) {
+            this.canaryDeployment = canaryDeployment;
+        }
+
+        public int getCanaryPercentage() {
+            return canaryPercentage;
+        }
+
+        public void setCanaryPercentage(int canaryPercentage) {
+            this.canaryPercentage = canaryPercentage;
         }
     }
 

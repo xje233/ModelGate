@@ -26,6 +26,7 @@ import io.modelgate.core.ChunkChoice;
 import io.modelgate.core.ChunkDelta;
 import io.modelgate.core.Choice;
 import io.modelgate.core.Message;
+import io.modelgate.core.PromptTokensDetails;
 import io.modelgate.core.Usage;
 
 /**
@@ -103,7 +104,7 @@ public class MockChatController {
         events.add(write(new ChatCompletionChunk(id, "chat.completion.chunk", created,
                 request.model(),
                 List.of(new ChunkChoice(0, new ChunkDelta(null, null), "stop")),
-                Usage.of(promptTokens, completionTokens))));
+                usage(promptTokens, completionTokens))));
 
         // pacing: TTFT then one chunk per interval; flush per frame; [DONE] terminates
         Flux<String> frames = Flux.interval(Duration.ofMillis(ttft),
@@ -124,7 +125,20 @@ public class MockChatController {
                 System.currentTimeMillis() / 1000,
                 request.model(),
                 List.of(new Choice(0, new Message("assistant", reply), "stop")),
-                Usage.of(estimateTokens(request), estimateTokens(reply)));
+                usage(estimateTokens(request), estimateTokens(reply)));
+    }
+
+    /**
+     * Reports a simulated prompt-cache hit share when {@code mock.simulated-cached-ratio} is set,
+     * so the gateway's cache-aware pricing has something to work with offline.
+     */
+    private Usage usage(int promptTokens, int completionTokens) {
+        double ratio = props.getSimulatedCachedRatio();
+        if (ratio <= 0) {
+            return Usage.of(promptTokens, completionTokens);
+        }
+        int cached = (int) Math.floor(promptTokens * Math.min(1.0, ratio));
+        return Usage.of(promptTokens, completionTokens, new PromptTokensDetails(cached, 0));
     }
 
     private String composeReply(ChatRequest request) {

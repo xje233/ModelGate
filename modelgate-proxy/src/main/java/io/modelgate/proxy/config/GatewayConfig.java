@@ -1,6 +1,7 @@
 package io.modelgate.proxy.config;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -11,12 +12,14 @@ import io.modelgate.client.LlmClient;
 import io.modelgate.client.ReactorLlmClient;
 import io.modelgate.core.Deployment;
 import io.modelgate.providers.ProviderRegistry;
+import io.modelgate.router.GroupPolicy;
 import io.modelgate.router.InProcessRouterState;
 import io.modelgate.router.RouterService;
 import io.modelgate.router.RouterState;
 import io.modelgate.proxy.metrics.MetricsRecorder;
 import io.modelgate.proxy.security.ApiKeyRegistry;
 import io.modelgate.proxy.service.GatewayService;
+import io.modelgate.proxy.service.UsageCollector;
 
 @Configuration
 public class GatewayConfig {
@@ -44,11 +47,19 @@ public class GatewayConfig {
     @Bean
     public RouterService routerService(RouterProperties properties, RouterState routerState) {
         List<Deployment> deployments = new ArrayList<>();
-        properties.getGroups().forEach((group, groupConfig) ->
-                groupConfig.getDeployments().forEach(dc -> deployments.add(new Deployment(
-                        dc.getName(), group, dc.getProvider(), dc.getModelId(),
-                        dc.getBaseUrl(), dc.getApiKey(), dc.getWeight(), dc.getHeaders()))));
-        return new RouterService(deployments, Map.copyOf(properties.getFallbacks()), routerState);
+        Map<String, GroupPolicy> policies = new LinkedHashMap<>();
+        properties.getGroups().forEach((group, groupConfig) -> {
+            groupConfig.getDeployments().forEach(dc -> deployments.add(new Deployment(
+                    dc.getName(), group, dc.getProvider(), dc.getModelId(),
+                    dc.getBaseUrl(), dc.getApiKey(), dc.getWeight(), dc.getHeaders())));
+            if (groupConfig.getCanaryDeployment() != null
+                    && !groupConfig.getCanaryDeployment().isBlank()) {
+                policies.put(group, GroupPolicy.canary(
+                        groupConfig.getCanaryDeployment(), groupConfig.getCanaryPercentage()));
+            }
+        });
+        return new RouterService(deployments, Map.copyOf(properties.getFallbacks()),
+                policies, routerState);
     }
 
     @Bean
@@ -58,7 +69,7 @@ public class GatewayConfig {
 
     @Bean
     public GatewayService gatewayService(RouterService router, LlmClient client,
-                                        MetricsRecorder metrics) {
-        return new GatewayService(router, client, metrics);
+                                        MetricsRecorder metrics, UsageCollector usage) {
+        return new GatewayService(router, client, metrics, usage);
     }
 }

@@ -1,5 +1,6 @@
 package io.modelgate.proxy.service;
 
+import java.util.List;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -20,7 +21,6 @@ import io.modelgate.core.Deployment;
 import io.modelgate.providers.json.Json;
 import io.modelgate.proxy.config.CacheProperties;
 import io.modelgate.proxy.metrics.MetricsRecorder;
-import io.modelgate.proxy.security.ApiKeyIdentity;
 import io.modelgate.router.RouterService;
 
 /**
@@ -52,11 +52,12 @@ public final class CompletionService {
     private final InFlightCoalescer coalescer;
     private final CacheProperties properties;
     private final MetricsRecorder metrics;
+    private final UsageCollector usage;
 
     public CompletionService(GatewayService gateway, LlmClient client, RouterService router,
                              SemanticCache cache, EmbeddingCache embeddingCache,
                              InFlightCoalescer coalescer, CacheProperties properties,
-                             MetricsRecorder metrics) {
+                             MetricsRecorder metrics, UsageCollector usage) {
         this.gateway = gateway;
         this.client = client;
         this.router = router;
@@ -65,19 +66,20 @@ public final class CompletionService {
         this.coalescer = coalescer;
         this.properties = properties;
         this.metrics = metrics;
+        this.usage = usage;
     }
 
-    public Mono<CompletionResult> complete(ChatRequest request, ApiKeyIdentity identity) {
+    public Mono<CompletionResult> complete(ChatRequest request, RequestContext context) {
         if (!cacheUsable(request)) {
-            return upstreamOnly(request, identity);
+            return upstreamOnly(request, context);
         }
-        String namespace = namespaceOf(request, identity);
+        String namespace = namespaceOf(request, context);
         if (!properties.isCoalescingEnabled()) {
-            return cacheFirst(request, identity, namespace);
+            return cacheFirst(request, context, namespace);
         }
         String key = namespace + '|' + EmbeddingCache.hash(cacheableText(request));
         return coalescer.coalesce(key,
-                () -> cacheFirst(request, identity, namespace),
+                () -> cacheFirst(request, context, namespace),
                 () -> metrics.recordCoalesced(request.model()));
     }
 
@@ -90,12 +92,12 @@ public final class CompletionService {
         }
     }
 
-    private Mono<CompletionResult> cacheFirst(ChatRequest request, ApiKeyIdentity identity,
+    private Mono<CompletionResult> cacheFirst(ChatRequest request, RequestContext context,
                                               String namespace) {
         return probe(request, namespace)
                 .flatMap(probe -> probe.hit()
-                        ? Mono.just(cachedResult(probe.lookup(), request))
-                        : upstream(request, identity, namespace, probe.vector()));
+                        ? Mono.just(cachedResult(probe.lookup(), request, context))
+                        : upstream(request, context, namespace, probe.vector()));
     }
 
     private Mono<Probe> probe(ChatRequest request, String namespace) {
@@ -124,7 +126,9 @@ public final class CompletionService {
                 });
     }
 
-    private CompletionResult cachedResult(CacheLookup lookup, ChatRequest request) {
+    private CompletionResult cachedResult(CacheLookup lookup, ChatRequest request,
+                                         RequestContext context) {
+        long now = System.currentTimeMillis();
         ChatResponse response = Json.read(lookup.payload(), ChatResponse.class);
         int savedPrompt = response.usage() == null || response.usage().promptTokens() == null
                 ? 0 : response.usage().promptTokens();
@@ -132,6 +136,10 @@ public final class CompletionService {
                 ? 0 : response.usage().completionTokens();
         metrics.recordCacheHit(request.model(), lookup.similarity(), savedPrompt, savedCompletion,
                 CostCalculator.costUsd(response.model(), response.usage()));
+        // a cache hit costs nothing upstream, but it is still a served request and must be
+        // attributed — including the routing arm, otherwise an experiment cannot be read
+        usage.record(context, request.model(), response.model(), "cache", response.usage(),
+                true, false, List.of(), "cache_hit", now, 0, now);
         return CompletionResult.fromCache(response, lookup.similarity());
     }
 
@@ -142,16 +150,16 @@ public final class CompletionService {
 
     // ------------------------------------------------------------------ upstream path
 
-    private Mono<CompletionResult> upstreamOnly(ChatRequest request, ApiKeyIdentity identity) {
-        return gateway.chat(request)
+    private Mono<CompletionResult> upstreamOnly(ChatRequest request, RequestContext context) {
+        return gateway.chat(request, context)
                 .map(routed -> CompletionResult.fromUpstream(
                         routed.value(), routed.deployment(), routed.attempted()));
     }
 
-    private Mono<CompletionResult> upstream(ChatRequest request, ApiKeyIdentity identity,
+    private Mono<CompletionResult> upstream(ChatRequest request, RequestContext context,
                                             String namespace, double[] vector) {
         metrics.recordCacheMiss(request.model());
-        return gateway.chat(request)
+        return gateway.chat(request, context)
                 .map(routed -> {
                     ChatResponse response = routed.value();
                     if (vector != null) {
@@ -175,9 +183,9 @@ public final class CompletionService {
      * another caller is a data leak, not a cache win. Request shape (temperature, limits) is
      * folded in too, since the same prompt at a different temperature is a different question.
      */
-    private String namespaceOf(ChatRequest request, ApiKeyIdentity identity) {
+    private String namespaceOf(ChatRequest request, RequestContext context) {
         String shape = request.temperature() + "|" + request.maxTokens() + "|" + request.topP();
-        return "sc:" + identity.id() + ":" + request.model() + ":"
+        return "sc:" + context.keyId() + ":" + request.model() + ":"
                 + EmbeddingCache.hash(shape).substring(0, 8);
     }
 

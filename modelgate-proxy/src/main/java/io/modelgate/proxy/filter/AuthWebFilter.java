@@ -38,7 +38,8 @@ public class AuthWebFilter implements WebFilter {
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
         String path = exchange.getRequest().getPath().value();
-        if (!path.startsWith("/v1/")) {
+        // /admin carries cost and tenant data, so it needs the same bearer check as the API
+        if (!path.startsWith("/v1/") && !path.startsWith("/admin/")) {
             return chain.filter(exchange);
         }
         String token = bearerToken(exchange);

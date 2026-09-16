@@ -10,9 +10,9 @@
     <version>0.1.0-SNAPSHOT</version>
   </parent>
 
-  <artifactId>modelgate-client</artifactId>
-  <name>ModelGate Client</name>
-  <description>SDK facade over the providers: blocking / async / streaming calls, timeouts, cost calculation.</description>
+  <artifactId>modelgate-usage</artifactId>
+  <name>ModelGate Usage</name>
+  <description>Usage and cost accounting: bounded-queue async batch writes plus aggregate queries.</description>
 
   <dependencies>
     <dependency>
@@ -21,32 +21,26 @@
       <version>${project.version}</version>
     </dependency>
     <dependency>
-      <groupId>io.modelgate</groupId>
-      <artifactId>modelgate-providers</artifactId>
-      <version>${project.version}</version>
+      <groupId>io.projectreactor</groupId>
+      <artifactId>reactor-core</artifactId>
     </dependency>
     <dependency>
       <groupId>org.springframework</groupId>
-      <artifactId>spring-webflux</artifactId>
-    </dependency>
-    <!-- spring-webflux declares spring-context as optional, but ReactorClientHttpConnector
-         implements SmartLifecycle: without it the IDE cannot resolve the type hierarchy. -->
-    <dependency>
-      <groupId>org.springframework</groupId>
-      <artifactId>spring-context</artifactId>
+      <artifactId>spring-jdbc</artifactId>
     </dependency>
     <dependency>
-      <groupId>io.projectreactor.netty</groupId>
-      <artifactId>reactor-netty-http</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>io.netty</groupId>
-      <artifactId>netty-handler</artifactId>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
     </dependency>
 
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.h2database</groupId>
+      <artifactId>h2</artifactId>
       <scope>test</scope>
     </dependency>
   </dependencies>

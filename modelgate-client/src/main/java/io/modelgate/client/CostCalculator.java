@@ -7,13 +7,37 @@ import java.util.Map;
 import io.modelgate.core.Usage;
 
 /**
- * Price-table based cost calculation (USD per 1M tokens). The bundled table mirrors
- * LiteLLM's public price sheet; unknown models price at zero and get logged instead.
+ * Price-table based cost calculation (USD per 1M tokens).
+ *
+ * <p>Prompt caching makes a naive "tokens × price" wrong, so the input side is split three ways:
+ * fresh tokens at list price, <b>cache hits</b> at a discount, <b>cache writes</b> at a premium.
+ * The multipliers differ per vendor — OpenAI bills a hit at 0.5× and a write at 2×, Anthropic
+ * bills both at 1.25× — which is exactly why cost accounting belongs in the gateway rather than
+ * in each caller.
  */
 public final class CostCalculator {
 
     /** input price, output price — USD per 1M tokens */
     private record Price(double input, double output) {
+    }
+
+    /** multipliers applied to the input price for cache hits / cache writes */
+    public record CachePricing(double hitMultiplier, double writeMultiplier) {
+
+        public static final CachePricing NONE = new CachePricing(1.0, 1.0);
+        public static final CachePricing OPENAI = new CachePricing(0.5, 2.0);
+        public static final CachePricing ANTHROPIC = new CachePricing(1.25, 1.25);
+        public static final CachePricing DEFAULT = OPENAI;
+
+        public static CachePricing forProvider(String provider) {
+            if (provider == null) {
+                return DEFAULT;
+            }
+            return switch (provider.toLowerCase()) {
+                case "anthropic", "claude" -> ANTHROPIC;
+                default -> DEFAULT;
+            };
+        }
     }
 
     private static final Map<String, Price> PRICES = Map.ofEntries(
@@ -38,6 +62,10 @@ public final class CostCalculator {
     }
 
     public static BigDecimal costUsd(String model, Usage usage) {
+        return costUsd(model, usage, CachePricing.DEFAULT);
+    }
+
+    public static BigDecimal costUsd(String model, Usage usage, CachePricing pricing) {
         if (usage == null || model == null) {
             return BigDecimal.ZERO;
         }
@@ -45,10 +73,22 @@ public final class CostCalculator {
         if (price == null) {
             return BigDecimal.ZERO;
         }
-        double in = usage.promptTokens() == null ? 0 : usage.promptTokens();
-        double out = usage.completionTokens() == null ? 0 : usage.completionTokens();
-        return BigDecimal.valueOf(in / 1_000_000.0 * price.input()
-                        + out / 1_000_000.0 * price.output())
+        int prompt = usage.prompt();
+        int cached = Math.min(usage.cachedPrompt(), prompt);
+        int cacheWrite = Math.min(usage.cacheWritePrompt(), Math.max(0, prompt - cached));
+        int fresh = Math.max(0, prompt - cached - cacheWrite);
+
+        double inputCost = fresh * price.input()
+                + cached * price.input() * pricing.hitMultiplier()
+                + cacheWrite * price.input() * pricing.writeMultiplier();
+        double outputCost = usage.completion() * price.output();
+
+        return BigDecimal.valueOf((inputCost + outputCost) / 1_000_000.0)
                 .setScale(6, RoundingMode.HALF_UP);
+    }
+
+    /** Tokens that would have been billed if the answer had been produced upstream. */
+    public static int totalTokens(Usage usage) {
+        return usage == null ? 0 : usage.prompt() + usage.completion();
     }
 }

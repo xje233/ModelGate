@@ -35,10 +35,18 @@ public final class RouterService {
     private final Map<String, List<Deployment>> groups;
     private final Map<String, Deployment> byName;
     private final Map<String, List<String>> fallbacks;
+    private final Map<String, GroupPolicy> policies;
     private final RouterState state;
 
     public RouterService(List<Deployment> deployments,
                          Map<String, List<String>> fallbacks,
+                         RouterState state) {
+        this(deployments, fallbacks, Map.of(), state);
+    }
+
+    public RouterService(List<Deployment> deployments,
+                         Map<String, List<String>> fallbacks,
+                         Map<String, GroupPolicy> policies,
                          RouterState state) {
         this.groups = deployments.stream()
                 .collect(Collectors.groupingBy(
@@ -46,8 +54,18 @@ public final class RouterService {
         this.byName = deployments.stream()
                 .collect(Collectors.toMap(Deployment::name, d -> d, (a, b) -> a, LinkedHashMap::new));
         this.fallbacks = Map.copyOf(fallbacks == null ? Map.of() : fallbacks);
+        this.policies = Map.copyOf(policies == null ? Map.of() : policies);
         this.state = state;
-        log.info("router initialized: groups={} fallbacks={}", groups.keySet(), this.fallbacks);
+        log.info("router initialized: groups={} fallbacks={} canary={}",
+                groups.keySet(), this.fallbacks, canaryGroups());
+    }
+
+    private List<String> canaryGroups() {
+        return policies.entrySet().stream()
+                .filter(e -> e.getValue().hasCanary())
+                .map(e -> e.getKey() + "->" + e.getValue().canaryDeployment()
+                        + "(" + e.getValue().canaryPercentage() + "%)")
+                .toList();
     }
 
     /** Lookup used by non-routing callers (e.g. the embedding deployment of the cache). */
@@ -69,18 +87,106 @@ public final class RouterService {
 
     /** Weighted-random ordered, cooldown-skipping list of the group's deployments. */
     public List<Deployment> candidates(String group) {
+        return candidates(group, null);
+    }
+
+    /**
+     * Ordering of the group's deployments for one caller.
+     *
+     * @param stickinessKey caller identity (API key id). For a canary group it decides the arm
+     *                      deterministically, so the same caller never flips between arms —
+     *                      which is what makes a canary experiment readable.
+     */
+    public List<Deployment> candidates(String group, String stickinessKey) {
         List<Deployment> list = groups.get(group);
         if (list == null || list.isEmpty()) {
             return List.of();
         }
-        return weightedOrder(list);
+        List<Deployment> available = list.stream()
+                .filter(d -> state.isAvailable(d.key()))
+                .collect(Collectors.toCollection(ArrayList::new));
+        if (available.isEmpty()) {
+            return List.of();
+        }
+        GroupPolicy policy = policies.getOrDefault(group, GroupPolicy.plain());
+        if (!policy.hasCanary()) {
+            return weightedOrder(available);
+        }
+        Deployment canary = available.stream()
+                .filter(d -> d.name().equals(policy.canaryDeployment()))
+                .findFirst()
+                .orElse(null);
+        if (canary == null) {
+            // canary deployment is not in the pool (or is in cooldown): degrade to the stable pool
+            return weightedOrder(available);
+        }
+        List<Deployment> ordered = new ArrayList<>(available.size());
+        if (inCanaryArm(stickinessKey, policy.canaryPercentage())) {
+            // canary first, the rest of the group stays behind it as the in-group retry path
+            ordered.add(canary);
+            available.stream().filter(d -> !d.equals(canary)).forEach(ordered::add);
+            return ordered;
+        }
+        List<Deployment> stable = available.stream().filter(d -> !d.equals(canary)).toList();
+        return weightedOrder(stable.isEmpty() ? available : stable);
+    }
+
+    /** Which arm a caller lands in: {@code canary}, {@code stable}, or {@code single}. */
+    public String armOf(String group, String stickinessKey) {
+        if (!groups.containsKey(group)) {
+            return "unknown";
+        }
+        GroupPolicy policy = policies.getOrDefault(group, GroupPolicy.plain());
+        if (!policy.hasCanary()) {
+            return "single";
+        }
+        return inCanaryArm(stickinessKey, policy.canaryPercentage()) ? "canary" : "stable";
+    }
+
+    /**
+     * Deterministic bucketing on the caller identity: same caller, same arm, forever.
+     * {@link String#hashCode()} is specified by the JDK, so the bucket is stable across JVMs
+     * and replicas — a caller does not switch arms by hitting a different gateway instance.
+     */
+    private static boolean inCanaryArm(String stickinessKey, int percentage) {
+        if (percentage <= 0) {
+            return false;
+        }
+        if (percentage >= 100) {
+            return true;
+        }
+        return bucketOf(stickinessKey == null ? "" : stickinessKey) < percentage;
+    }
+
+    /**
+     * Bucket in [0, 100) after an avalanche mix.
+     *
+     * <p>The mix is not decoration. {@code String.hashCode()} of sequentially issued caller ids
+     * differs by exactly 1 ({@code key-a}=…411, {@code key-b}=…412), so bucketing the raw hash
+     * puts consecutive callers in consecutive buckets — a 30% canary then becomes "the first N
+     * letters of your naming scheme", which is neither a random sample nor a bounded blast
+     * radius. Running the hash through the MurmurHash3 32-bit finalizer decorrelates neighbours
+     * while staying deterministic across JVMs and replicas.
+     */
+    private static int bucketOf(String key) {
+        int hash = key.hashCode();
+        hash ^= hash >>> 16;
+        hash *= 0x85ebca6b;
+        hash ^= hash >>> 13;
+        hash *= 0xc2b2ae35;
+        hash ^= hash >>> 16;
+        return Math.floorMod(hash, 100);
     }
 
     /** Full attempt chain: own group first, then fallback groups in configured order. */
     public List<Deployment> chain(String group) {
-        List<Deployment> result = new ArrayList<>(candidates(group));
+        return chain(group, null);
+    }
+
+    public List<Deployment> chain(String group, String stickinessKey) {
+        List<Deployment> result = new ArrayList<>(candidates(group, stickinessKey));
         for (String fallbackGroup : fallbacks.getOrDefault(group, List.of())) {
-            result.addAll(candidates(fallbackGroup));
+            result.addAll(candidates(fallbackGroup, stickinessKey));
         }
         return result;
     }
@@ -93,11 +199,16 @@ public final class RouterService {
         state.recordFailure(deployment.key());
     }
 
-    /** Weighted sampling without replacement: every available candidate appears exactly once. */
-    private List<Deployment> weightedOrder(List<Deployment> deployments) {
-        List<Deployment> pool = deployments.stream()
-                .filter(d -> state.isAvailable(d.key()))
-                .collect(Collectors.toCollection(ArrayList::new));
+    /**
+     * Weighted sampling without replacement: every candidate appears exactly once.
+     *
+     * <p>Takes an <b>already filtered</b> pool on purpose: {@link RouterState#isAvailable} has a
+     * side effect (it hands out the single HALF_OPEN probe permit), so it must be called exactly
+     * once per deployment per routing decision — calling it again here would consume the permit
+     * and silently drop a recovering deployment out of rotation.
+     */
+    private List<Deployment> weightedOrder(List<Deployment> available) {
+        List<Deployment> pool = new ArrayList<>(available);
         List<Deployment> ordered = new ArrayList<>(pool.size());
         while (!pool.isEmpty()) {
             int total = 0;

@@ -296,7 +296,25 @@ CREATE TABLE t_usage_log (
 
 ---
 
-## 11. 面试叙事要点（自我提醒）
+## 11. 实施状态（滚动更新）
+
+| 周 | 目标 | 状态 | 交付物 |
+|---|---|---|---|
+| W1 | 骨架 + 入口 / 加权路由 / SSE 透传 | ✅ | 6 模块 Maven 工程；canonical 类型；Provider SPI；加权路由；逐帧 flush 的 SSE 透传；Mock 上游 |
+| W2 | 三层配额 + JMeter 压测 | ✅ | `modelgate-quota`（进程内 + Redis+Lua 双后端，三维度一次原子校验）；429 + Retry-After；QPS/P99/错误率三数（[报告](loadtest/RESULTS.md)） |
+| W3 | 语义缓存 + 熔断 + 可观测 + JVM | ✅ | `modelgate-cache`（余弦检索、双后端、嵌入缓存、in-flight 合并）；熔断状态机（双信号 + 半开探测 + 指数退避）；15 类指标 + Grafana 面板；JVM 三档对照（[报告](loadtest/RESULTS-W3.md)） |
+| W4 | 灰度 + 用量成本落库 + 收尾 | ✅ | 按调用方粘性的 canary 分桶（含哈希雪崩修复）；`modelgate-usage`（有界队列 + 批量落库 + 5 维聚合）；prompt cache 计价；架构图与[面试话术](docs/interview-narrative.md) |
+
+### 有意留下的边界（面试时要主动交底）
+
+1. **熔断状态是进程内的**：多副本各看各的。接口（`RouterState`）已抽好，Redis 实现照 `modelgate-quota` 的模式补即可。
+2. **MySQL 控制面未接线**：`t_tenant` / `t_api_key` / `t_model` 的 DDL 已就位（`ops/sql/schema.sql`），
+   当前身份与路由仍由 `application.yml` 承担；用量落库已接通（本地 H2、生产 MySQL 同一套 SQL）。
+3. **Grafana 面板未渲染验证**：本机没有 Docker，只验证了 `/actuator/prometheus` 的指标导出。
+4. **流式记账出现过 1 次未采到 usage**（未复现）：已记入 `verify/W4-verification.md`，
+   生产应加"流式结束 usage 为空即告警"的断言。
+
+## 12. 面试叙事要点（自我提醒）
 
 - 三层语义讲清楚：**retry（组内换部署）/ fallback（跨组）/ cooldown（摘单部署）**——大多数自研项目把这三件事揉成一坨
 - 语义缓存要能答：阈值 0.95 的依据、跨用户隔离、in-flight 合并防击穿、流式为何不缓存

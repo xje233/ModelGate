@@ -24,6 +24,13 @@ public class MockProperties {
     /** baseline random failure rate (0..1), can be overridden per request by header */
     private double errorRate = 0.0;
 
+    /**
+     * Simulated prompt-cache hit ratio (0..1): the share of prompt tokens reported back as
+     * {@code prompt_tokens_details.cached_tokens}, so the gateway's cache-aware pricing can be
+     * exercised without a real provider.
+     */
+    private double simulatedCachedRatio = 0.0;
+
     public String getName() {
         return name;
     }
@@ -70,5 +77,13 @@ public class MockProperties {
 
     public void setErrorRate(double errorRate) {
         this.errorRate = errorRate;
+    }
+
+    public double getSimulatedCachedRatio() {
+        return simulatedCachedRatio;
+    }
+
+    public void setSimulatedCachedRatio(double simulatedCachedRatio) {
+        this.simulatedCachedRatio = simulatedCachedRatio;
     }
 }

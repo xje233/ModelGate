@@ -9,6 +9,18 @@ spring:
       host: 127.0.0.1
       port: 6379
       timeout: 2000ms
+  datasource:
+    # 本地演示用 H2（同一套 SQL 换 URL/驱动即接 MySQL：
+    # jdbc:mysql://127.0.0.1:3306/modelgate + com.mysql.cj.jdbc.Driver）
+    url: jdbc:h2:mem:modelgate;MODE=MySQL;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  sql:
+    init:
+      # 表结构不自动创建：jdbc 用量后端需显式打开
+      #   --spring.sql.init.mode=always --spring.sql.init.schema-locations=classpath:db/schema-h2.sql
+      mode: never
 
 modelgate:
   security:
@@ -17,11 +29,18 @@ modelgate:
       - value: sk-local-test-1
         id: key-a
         tenant: tenant-a
-        models: [ fast-medium, smart, broken ]
+        models: [ fast-medium, smart, broken, ab-test ]
         rpm: 60
         tpm: 100000
       - value: sk-local-test-2
         id: key-b
+        tenant: tenant-b
+        models: [ "*" ]
+        rpm: 600
+        tpm: 2000000
+      # 第三个 key 只是为了灰度演示时能同时覆盖两个臂（臂是按 key 哈希分桶的）
+      - value: sk-local-test-3
+        id: key-c
         tenant: tenant-b
         models: [ "*" ]
         rpm: 600
@@ -57,6 +76,14 @@ modelgate:
       broken:
         rpm: 1000
         tpm: 2000000
+
+  usage:
+    # memory = 内存环形缓冲（默认，零依赖）；jdbc = 批量写入 t_usage_log
+    backend: memory
+    memory-max-records: 20000
+    queue-capacity: 20000
+    batch-size: 500
+    flush-interval-millis: 1000
 
   cache:
     enabled: true
@@ -100,6 +127,22 @@ modelgate:
             model-id: mock-smart
             base-url: http://127.0.0.1:9001
             weight: 5
+      # ab-test: 灰度分流演示。按调用方（API key）哈希分桶，30% 落到 canary 臂，
+      # 同一个 key 永远落在同一臂（否则实验数据没法和基线比）
+      ab-test:
+        canary-deployment: mock-ab-canary
+        canary-percentage: 30
+        deployments:
+          - name: mock-ab-stable
+            provider: mock
+            model-id: mock-fast-a
+            base-url: http://127.0.0.1:9001
+            weight: 10
+          - name: mock-ab-canary
+            provider: mock
+            model-id: mock-fast-b
+            base-url: http://127.0.0.1:9002
+            weight: 10
       # embeddings: 语义缓存的向量来源（mock 提供确定性的哈希 bigram 向量）
       embeddings:
         deployments:

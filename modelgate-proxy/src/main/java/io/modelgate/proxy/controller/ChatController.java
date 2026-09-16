@@ -27,15 +27,16 @@ import io.modelgate.proxy.service.CompletionService;
 import io.modelgate.proxy.service.CompletionResult;
 import io.modelgate.proxy.service.GatewayService;
 import io.modelgate.proxy.service.QuotaGuard;
+import io.modelgate.proxy.service.RequestContext;
 import io.modelgate.router.RouterService;
 
 /**
  * OpenAI-compatible public endpoint.
  *
  * <p>Order per request: authenticate (filter) -> guard (allow-list + three quota dimensions)
- * -> semantic cache probe -> route -> respond -> asynchronously account tokens.
- * Both response modes are written manually so encoding never depends on content negotiation,
- * and every SSE frame is flushed as soon as it arrives.
+ * -> pick the routing arm -> semantic cache probe -> route -> respond -> asynchronously account
+ * tokens. Both response modes are written manually so encoding never depends on content
+ * negotiation, and every SSE frame is flushed as soon as it arrives.
  *
  * <p>Streaming deliberately bypasses the semantic cache: you cannot know a streamed answer is
  * a duplicate until it has finished, by which point the tokens are already spent.
@@ -65,18 +66,22 @@ public class ChatController {
         ServerHttpResponse response = exchange.getResponse();
         return guard.guard(request, identity)
                 .flatMap(guarded -> {
+                    // deterministic per caller, so a canary experiment is readable
+                    String arm = router.armOf(request.model(), identity.id());
+                    RequestContext context = RequestContext.of(identity.id(), identity.tenant(), arm);
+                    setHeader(response, "x-modelgate-arm", arm);
                     setHeader(response, "x-ratelimit-remaining-requests",
                             Long.toString(guarded.decision().remainingRequests()));
                     if (Boolean.TRUE.equals(request.stream())) {
-                        return stream(request, response, guarded);
+                        return stream(request, response, guarded, context);
                     }
-                    return blocking(request, response, guarded, identity);
+                    return blocking(request, response, guarded, context);
                 });
     }
 
     private Mono<Void> blocking(ChatRequest request, ServerHttpResponse response,
-                                QuotaGuard.Guarded guarded, ApiKeyIdentity identity) {
-        return completion.complete(request, identity)
+                                QuotaGuard.Guarded guarded, RequestContext context) {
+        return completion.complete(request, context)
                 .flatMap(result -> {
                     ChatResponse body = result.response();
                     response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
@@ -102,11 +107,11 @@ public class ChatController {
     }
 
     private Mono<Void> stream(ChatRequest request, ServerHttpResponse response,
-                              QuotaGuard.Guarded guarded) {
+                              QuotaGuard.Guarded guarded, RequestContext context) {
         response.getHeaders().setContentType(MediaType.TEXT_EVENT_STREAM);
         DataBufferFactory buffers = response.bufferFactory();
         AtomicBoolean charged = new AtomicBoolean(false);
-        Flux<DataBuffer> frames = gateway.chatStream(request, response)
+        Flux<DataBuffer> frames = gateway.chatStream(request, response, context)
                 .doOnNext(chunk -> {
                     // usage arrives in the final frame; charge once, off the critical path
                     if (chunk.usage() != null && charged.compareAndSet(false, true)) {

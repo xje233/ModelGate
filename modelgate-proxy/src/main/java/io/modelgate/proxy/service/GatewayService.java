@@ -18,14 +18,18 @@ import io.modelgate.core.ChatCompletionChunk;
 import io.modelgate.core.ChatRequest;
 import io.modelgate.core.ChatResponse;
 import io.modelgate.core.Deployment;
+import io.modelgate.core.Usage;
 import io.modelgate.proxy.metrics.MetricsRecorder;
 import io.modelgate.router.RouterService;
 
 /**
  * The heart of the data plane. Walks the router's attempt chain
  * (own group first = retry, then fallback groups) and feeds every attempt outcome into the
- * circuit state. It is also where the upstream-side metrics live, because this is the only
- * layer that knows which deployment actually served the request and how long the upstream took.
+ * circuit state.
+ *
+ * <p>It is also where upstream-side metrics <b>and usage receipts</b> are produced, because this
+ * is the only layer that knows which deployment actually served the request, how long the
+ * upstream took, and which tokens were consumed.
  *
  * <p>Streaming failover rule: an upstream may only be retried if no chunk has been emitted yet —
  * once bytes have reached the client, retrying would duplicate output, so the error propagates.
@@ -37,11 +41,14 @@ public final class GatewayService {
     private final RouterService router;
     private final LlmClient client;
     private final MetricsRecorder metrics;
+    private final UsageCollector usage;
 
-    public GatewayService(RouterService router, LlmClient client, MetricsRecorder metrics) {
+    public GatewayService(RouterService router, LlmClient client, MetricsRecorder metrics,
+                          UsageCollector usage) {
         this.router = router;
         this.client = client;
         this.metrics = metrics;
+        this.usage = usage;
     }
 
     /** A completed call plus the routing metadata that belongs to it. */
@@ -49,18 +56,27 @@ public final class GatewayService {
                             long upstreamNanos) {
     }
 
-    public Mono<Routed<ChatResponse>> chat(ChatRequest request) {
+    public Mono<Routed<ChatResponse>> chat(ChatRequest request, RequestContext context) {
         return Mono.defer(() -> {
-            long start = System.nanoTime();
-            List<Deployment> chain = router.chain(request.model());
+            long startMillis = System.currentTimeMillis();
+            long startNanos = System.nanoTime();
+            List<Deployment> chain = router.chain(request.model(), context.keyId());
             if (chain.isEmpty()) {
                 return Mono.error(new NoSuchModelException(request.model()));
             }
             CopyOnWriteArrayList<String> attempted = new CopyOnWriteArrayList<>();
             return attemptChat(chain, 0, request, attempted)
-                    .doOnNext(routed -> metrics.recordSuccess(request.model(),
-                            routed.deployment().provider(), false,
-                            System.nanoTime() - start, routed.upstreamNanos()));
+                    .doOnNext(routed -> {
+                        metrics.recordSuccess(request.model(), routed.deployment().provider(), false,
+                                System.nanoTime() - startNanos, routed.upstreamNanos());
+                        usage.record(context, request.model(),
+                                routed.deployment().modelId(), routed.deployment().provider(),
+                                routed.value().usage(), false, false, routed.attempted(),
+                                "success", startMillis, 0, System.currentTimeMillis());
+                    })
+                    .doOnError(e -> usage.record(context, request.model(), null, null, null,
+                            false, false, List.of(), statusOf(e), startMillis, 0,
+                            System.currentTimeMillis()));
         })
                 .doOnSubscribe(s -> metrics.requestStarted())
                 .doOnError(e -> metrics.recordFailure(request.model(), providerOf(e), false, statusOf(e)))
@@ -93,10 +109,12 @@ public final class GatewayService {
                 });
     }
 
-    public Flux<ChatCompletionChunk> chatStream(ChatRequest request, ServerHttpResponse response) {
+    public Flux<ChatCompletionChunk> chatStream(ChatRequest request, ServerHttpResponse response,
+                                                RequestContext context) {
         return Flux.defer(() -> {
-            long start = System.nanoTime();
-            List<Deployment> chain = router.chain(request.model());
+            long startMillis = System.currentTimeMillis();
+            long startNanos = System.nanoTime();
+            List<Deployment> chain = router.chain(request.model(), context.keyId());
             if (chain.isEmpty()) {
                 return Flux.error(new NoSuchModelException(request.model()));
             }
@@ -104,13 +122,29 @@ public final class GatewayService {
             AtomicBoolean emitted = new AtomicBoolean(false);
             AtomicReference<Deployment> current = new AtomicReference<>();
             AtomicBoolean firstChunk = new AtomicBoolean(true);
+            AtomicReference<Long> firstTokenMillis = new AtomicReference<>(0L);
+            AtomicReference<Usage> lastUsage = new AtomicReference<>();
             return attemptStream(chain, 0, request, attempted, response, emitted,
-                    current, firstChunk, start)
-                    .doOnComplete(() -> metrics.recordSuccess(request.model(),
-                            providerOf(current.get()), true, System.nanoTime() - start, -1));
+                    current, firstChunk, firstTokenMillis, lastUsage, startNanos)
+                    .doOnComplete(() -> {
+                        Deployment deployment = current.get();
+                        metrics.recordSuccess(request.model(), providerOf(deployment), true,
+                                System.nanoTime() - startNanos, -1);
+                        usage.record(context, request.model(),
+                                deployment == null ? null : deployment.modelId(),
+                                providerOf(deployment), lastUsage.get(), false, true,
+                                List.of(),
+                                "success", startMillis, firstTokenMillis.get(),
+                                System.currentTimeMillis());
+                    });
         })
                 .doOnSubscribe(s -> metrics.requestStarted())
-                .doOnError(e -> metrics.recordFailure(request.model(), "unknown", true, statusOf(e)))
+                .doOnError(e -> {
+                    metrics.recordFailure(request.model(), "unknown", true, statusOf(e));
+                    usage.record(context, request.model(), null, null, null, false, true,
+                            List.of(), statusOf(e), System.currentTimeMillis(), 0,
+                            System.currentTimeMillis());
+                })
                 .doFinally(signal -> metrics.requestFinished());
     }
 
@@ -121,7 +155,9 @@ public final class GatewayService {
                                                     AtomicBoolean emitted,
                                                     AtomicReference<Deployment> current,
                                                     AtomicBoolean firstChunk,
-                                                    long start) {
+                                                    AtomicReference<Long> firstTokenMillis,
+                                                    AtomicReference<Usage> lastUsage,
+                                                    long startNanos) {
         if (index >= chain.size()) {
             return Flux.error(new UpstreamException(502,
                     "all upstream attempts failed: " + attempted, false));
@@ -135,8 +171,12 @@ public final class GatewayService {
         return client.chatStream(deployment, request)
                 .doOnNext(chunk -> {
                     emitted.set(true);
+                    if (chunk.usage() != null) {
+                        lastUsage.set(chunk.usage());
+                    }
                     if (firstChunk.compareAndSet(true, false)) {
-                        metrics.recordTtft(deployment.provider(), System.nanoTime() - start);
+                        firstTokenMillis.set(System.currentTimeMillis());
+                        metrics.recordTtft(deployment.provider(), System.nanoTime() - startNanos);
                     }
                     if (successMarked.compareAndSet(false, true)) {
                         router.recordSuccess(deployment);
@@ -153,7 +193,7 @@ public final class GatewayService {
                     log.warn("stream attempt failed on {}, failing over: {}",
                             deployment.key(), e.getMessage());
                     return attemptStream(chain, index + 1, request, attempted, response,
-                            emitted, current, firstChunk, start);
+                            emitted, current, firstChunk, firstTokenMillis, lastUsage, startNanos);
                 });
     }
 

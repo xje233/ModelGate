@@ -46,6 +46,21 @@
       <version>${project.version}</version>
     </dependency>
     <dependency>
+      <groupId>io.modelgate</groupId>
+      <artifactId>modelgate-usage</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-jdbc</artifactId>
+    </dependency>
+    <!-- 只是为了让 jdbc 用量后端在本地可跑（同一套 SQL 换 URL 即接 MySQL），生产可移除 -->
+    <dependency>
+      <groupId>com.h2database</groupId>
+      <artifactId>h2</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+    <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-webflux</artifactId>
     </dependency>

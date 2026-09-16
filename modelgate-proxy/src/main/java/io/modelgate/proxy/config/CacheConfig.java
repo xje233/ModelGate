@@ -14,6 +14,7 @@ import io.modelgate.client.LlmClient;
 import io.modelgate.proxy.metrics.MetricsRecorder;
 import io.modelgate.proxy.service.CompletionService;
 import io.modelgate.proxy.service.GatewayService;
+import io.modelgate.proxy.service.UsageCollector;
 import io.modelgate.router.RouterService;
 
 /**
@@ -42,9 +43,10 @@ public class CacheConfig {
     @Bean
     public CompletionService completionService(GatewayService gateway, LlmClient client,
                                                RouterService router, SemanticCache cache,
-                                               CacheProperties properties, MetricsRecorder metrics) {
+                                               CacheProperties properties, MetricsRecorder metrics,
+                                               UsageCollector usage) {
         return new CompletionService(gateway, client, router, cache,
                 new EmbeddingCache(properties.getEmbeddingCacheEntries(), properties.getTtlSeconds()),
-                new InFlightCoalescer(), properties, metrics);
+                new InFlightCoalescer(), properties, metrics, usage);
     }
 }

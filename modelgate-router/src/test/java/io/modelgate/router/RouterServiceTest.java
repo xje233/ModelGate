@@ -182,4 +182,101 @@ class RouterServiceTest {
         assertTrue(router.chain("nope").isEmpty());
         assertFalse(router.hasGroup("nope"));
     }
+
+    // ------------------------------------------------------------------ canary / A-B
+
+    private static RouterService canaryRouter(InProcessRouterState state, int percentage) {
+        return new RouterService(
+                List.of(dep("g", "stable-1", 10), dep("g", "stable-2", 10), dep("g", "canary", 10)),
+                Map.of(),
+                Map.of("g", GroupPolicy.canary("canary", percentage)),
+                state);
+    }
+
+    /** Find a caller id that lands in the given arm — mirrors how a real client would be bucketed. */
+    private static String callerIn(String arm, RouterService router) {
+        for (int i = 0; i < 10_000; i++) {
+            String candidate = "key-" + i;
+            if (arm.equals(router.armOf("g", candidate))) {
+                return candidate;
+            }
+        }
+        throw new IllegalStateException("no caller found in arm " + arm);
+    }
+
+    @Test
+    void canaryArmIsStickyPerCaller() {
+        RouterService router = canaryRouter(new InProcessRouterState(3, 60), 10);
+        String caller = callerIn("canary", router);
+
+        for (int i = 0; i < 50; i++) {
+            assertEquals("canary", router.armOf("g", caller), "same caller must not flip arms");
+            assertEquals("canary", router.candidates("g", caller).get(0).name());
+        }
+    }
+
+    @Test
+    void canaryTrafficShareMatchesConfig() {
+        RouterService router = canaryRouter(new InProcessRouterState(3, 60), 10);
+        int canary = 0;
+        int samples = 5_000;
+        for (int i = 0; i < samples; i++) {
+            if ("canary".equals(router.armOf("g", "user-" + i))) {
+                canary++;
+            }
+        }
+        double ratio = canary / (double) samples;
+        assertTrue(ratio > 0.07 && ratio < 0.13, "expected ~10%, got " + ratio);
+    }
+
+    @Test
+    void stableArmNeverSeesTheCanaryDeployment() {
+        RouterService router = canaryRouter(new InProcessRouterState(3, 60), 10);
+        String caller = callerIn("stable", router);
+
+        List<String> names = router.candidates("g", caller).stream().map(Deployment::name).toList();
+        assertFalse(names.contains("canary"), "stable caller must not be routed to the canary: " + names);
+        assertEquals(2, names.size());
+    }
+
+    @Test
+    void canaryArmFallsBackToTheStablePoolWhenCanaryIsInCooldown() {
+        InProcessRouterState state = new InProcessRouterState(3, 60);
+        RouterService router = canaryRouter(state, 10);
+        String caller = callerIn("canary", router);
+
+        for (int i = 0; i < 3; i++) {
+            router.recordFailure(router.deploymentByName("canary"));
+        }
+        List<String> names = router.candidates("g", caller).stream().map(Deployment::name).toList();
+        assertFalse(names.contains("canary"), "cooled-down canary must drop out of rotation");
+        assertEquals(2, names.size());
+    }
+
+    @Test
+    void plainGroupsReportTheSingleArm() {
+        RouterService router = router(new InProcessRouterState(3, 60), dep("g", "a", 10));
+        assertEquals("single", router.armOf("g", "key-a"));
+        assertEquals("unknown", router.armOf("nope", "key-a"));
+    }
+
+    /**
+     * Regression: sequentially issued caller ids must not land in adjacent buckets. Raw
+     * {@code hashCode()} puts "key-a".."key-s" all under a 30% threshold (19 of 26), which would
+     * turn a canary rollout into "the first N letters of our naming scheme".
+     */
+    @Test
+    void sequentialCallerIdsDoNotClumpIntoOneArm() {
+        RouterService router = canaryRouter(new InProcessRouterState(3, 60), 30);
+        int canary = 0;
+        int total = 0;
+        for (char c = 'a'; c <= 'z'; c++) {
+            total++;
+            if ("canary".equals(router.armOf("g", "key-" + c))) {
+                canary++;
+            }
+        }
+        assertTrue(canary >= 2 && canary <= 14,
+                "expected a spread of arms over 26 sequential ids, got " + canary + "/" + total);
+    }
 }
