@@ -20,11 +20,20 @@ public class RouterProperties {
     /** group -> ordered fallback groups */
     private Map<String, List<String>> fallbacks = new LinkedHashMap<>();
 
-    /** consecutive failures before a deployment is cooled down */
+    /** consecutive failures before a deployment is taken out of rotation */
     private int allowedFails = 3;
 
-    /** cooldown duration in seconds */
+    /** base cooldown in seconds (doubles on each consecutive trip, capped at 10x) */
     private long cooldownSeconds = 60;
+
+    /** sliding window size for the failure-rate signal */
+    private int failureWindowSize = 20;
+
+    /** trip when the failure rate over the window reaches this value */
+    private double failureRateThreshold = 0.5;
+
+    /** minimum samples before the failure rate is trusted */
+    private int minCallsForRate = 10;
 
     public static class GroupConfig {
         private List<DeploymentConfig> deployments = new ArrayList<>();
@@ -134,5 +143,29 @@ public class RouterProperties {
 
     public void setCooldownSeconds(long cooldownSeconds) {
         this.cooldownSeconds = cooldownSeconds;
+    }
+
+    public int getFailureWindowSize() {
+        return failureWindowSize;
+    }
+
+    public void setFailureWindowSize(int failureWindowSize) {
+        this.failureWindowSize = failureWindowSize;
+    }
+
+    public double getFailureRateThreshold() {
+        return failureRateThreshold;
+    }
+
+    public void setFailureRateThreshold(double failureRateThreshold) {
+        this.failureRateThreshold = failureRateThreshold;
+    }
+
+    public int getMinCallsForRate() {
+        return minCallsForRate;
+    }
+
+    public void setMinCallsForRate(int minCallsForRate) {
+        this.minCallsForRate = minCallsForRate;
     }
 }

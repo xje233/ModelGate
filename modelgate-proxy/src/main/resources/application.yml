@@ -58,9 +58,27 @@ modelgate:
         rpm: 1000
         tpm: 2000000
 
+  cache:
+    enabled: true
+    # memory = 单实例；redis = 多副本共享缓存与省钱统计
+    backend: memory
+    # 0.95 只命中近乎相同的提问（安全）；0.85 能命中改述，但有答非所问的风险
+    similarity-threshold: 0.95
+    ttl-seconds: 1800
+    max-entries-per-namespace: 200
+    # 承接 embedding 调用的 deployment 名（必须在下面的 router.groups 里存在）
+    embedding-deployment: mock-embed
+    embedding-cache-entries: 2000
+    # 相同请求在飞行中合并，防止冷缓存瞬间打爆上游
+    coalescing-enabled: true
+
   router:
     allowed-fails: 3
     cooldown-seconds: 60
+    # 熔断的第二个信号：窗口内失败率（只靠连续失败会漏掉"轮流失败"的抖动上游）
+    failure-window-size: 20
+    failure-rate-threshold: 0.5
+    min-calls-for-rate: 10
     groups:
       # fast-medium: 70/30 weighted split across two mock instances
       fast-medium:
@@ -82,6 +100,14 @@ modelgate:
             model-id: mock-smart
             base-url: http://127.0.0.1:9001
             weight: 5
+      # embeddings: 语义缓存的向量来源（mock 提供确定性的哈希 bigram 向量）
+      embeddings:
+        deployments:
+          - name: mock-embed
+            provider: mock
+            model-id: mock-embed
+            base-url: http://127.0.0.1:9001
+            weight: 1
       # broken: always answers 500 — exists to demo cooldown + fallback in action
       broken:
         deployments:

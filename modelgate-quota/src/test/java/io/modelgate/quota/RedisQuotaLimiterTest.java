@@ -4,9 +4,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.Optional;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -14,20 +16,24 @@ import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 
+import io.modelgate.testkit.RedisTestServer;
+
 /**
  * Runs the real Lua scripts against a real Redis. This is the test that proves the
  * single-round-trip atomic path works, not just the in-process fallback.
  */
 class RedisQuotaLimiterTest {
 
-    private static LocalRedis server;
+    private static RedisTestServer server;
     private static LettuceConnectionFactory connectionFactory;
     private static ReactiveStringRedisTemplate redis;
     private static RedisQuotaLimiter limiter;
 
     @BeforeAll
     static void startRedis() throws IOException {
-        server = LocalRedis.start();
+        Optional<RedisTestServer> started = RedisTestServer.tryStart();
+        assumeTrue(started.isPresent(), RedisTestServer.hint());
+        server = started.get();
         connectionFactory = new LettuceConnectionFactory("127.0.0.1", server.port());
         connectionFactory.afterPropertiesSet();
         redis = new ReactiveStringRedisTemplate(connectionFactory);

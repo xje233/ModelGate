@@ -1,6 +1,7 @@
 package io.modelgate.router;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -19,11 +20,12 @@ import io.modelgate.core.Deployment;
  *
  * <p>Three distinct mechanisms (do not conflate them):
  * <ul>
- *   <li><b>candidates</b> — in-group ordering (weighted random, cooling deployments skipped)</li>
+ *   <li><b>candidates</b> — in-group ordering (weighted random, deployments whose breaker is
+ *       OPEN are skipped; a HALF_OPEN one is offered as the recovery probe)</li>
  *   <li><b>chain</b> — candidates plus fallback groups appended in configured order.
  *       Walking the chain implements retry (in-group, next deployment) and
  *       fallback (cross-group, different provider/model) in one pass.</li>
- *   <li><b>cooldown</b> — per-deployment circuit state, owned by {@link RouterState}</li>
+ *   <li><b>circuit state</b> — per-deployment CLOSED/OPEN/HALF_OPEN, owned by {@link RouterState}</li>
  * </ul>
  */
 public final class RouterService {
@@ -31,6 +33,7 @@ public final class RouterService {
     private static final Logger log = LoggerFactory.getLogger(RouterService.class);
 
     private final Map<String, List<Deployment>> groups;
+    private final Map<String, Deployment> byName;
     private final Map<String, List<String>> fallbacks;
     private final RouterState state;
 
@@ -40,9 +43,20 @@ public final class RouterService {
         this.groups = deployments.stream()
                 .collect(Collectors.groupingBy(
                         Deployment::group, LinkedHashMap::new, Collectors.toList()));
+        this.byName = deployments.stream()
+                .collect(Collectors.toMap(Deployment::name, d -> d, (a, b) -> a, LinkedHashMap::new));
         this.fallbacks = Map.copyOf(fallbacks == null ? Map.of() : fallbacks);
         this.state = state;
         log.info("router initialized: groups={} fallbacks={}", groups.keySet(), this.fallbacks);
+    }
+
+    /** Lookup used by non-routing callers (e.g. the embedding deployment of the cache). */
+    public Deployment deploymentByName(String name) {
+        return byName.get(name);
+    }
+
+    public Collection<Deployment> deployments() {
+        return byName.values();
     }
 
     public Set<String> groups() {
@@ -79,11 +93,11 @@ public final class RouterService {
         state.recordFailure(deployment.key());
     }
 
-    /** Weighted sampling without replacement: every candidate appears exactly once. */
+    /** Weighted sampling without replacement: every available candidate appears exactly once. */
     private List<Deployment> weightedOrder(List<Deployment> deployments) {
         List<Deployment> pool = deployments.stream()
-                .filter(d -> !state.isCoolingDown(d.key()))
-                .collect(java.util.stream.Collectors.toCollection(ArrayList::new));
+                .filter(d -> state.isAvailable(d.key()))
+                .collect(Collectors.toCollection(ArrayList::new));
         List<Deployment> ordered = new ArrayList<>(pool.size());
         while (!pool.isEmpty()) {
             int total = 0;

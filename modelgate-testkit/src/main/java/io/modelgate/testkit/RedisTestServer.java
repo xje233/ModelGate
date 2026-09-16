@@ -1,50 +1,65 @@
-package io.modelgate.quota;
+package io.modelgate.testkit;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.api.StatefulRedisConnection;
 
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
-
 /**
  * Starts a throwaway redis-server for integration tests.
  *
- * <p>The binary is resolved in this order:
- * <ol>
- *   <li>{@code -Dmodelgate.test.redis.binary=/path/to/redis-server}</li>
- *   <li>{@code MODELGATE_REDIS_BINARY} environment variable</li>
- *   <li>common install locations (including {@code $HOME/.local/redis-src/bin/redis-server})</li>
- * </ol>
- * When none is found the test is skipped instead of failing, so plain {@code mvn test}
- * stays green on a machine without Redis.
+ * <p>The binary is resolved from (in order): the {@code modelgate.test.redis.binary} system
+ * property, the {@code MODELGATE_REDIS_BINARY} environment variable, then common install
+ * locations. Callers are expected to <b>skip</b> (not fail) when no binary is found, so
+ * {@code mvn test} stays green on a machine without Redis:
+ *
+ * <pre>{@code
+ * Optional<RedisTestServer> server = RedisTestServer.tryStart();
+ * assumeTrue(server.isPresent(), RedisTestServer.hint());
+ * }</pre>
  */
-final class LocalRedis implements AutoCloseable {
+public final class RedisTestServer implements AutoCloseable {
 
     private final Process process;
     private final int port;
 
-    private LocalRedis(Process process, int port) {
+    private RedisTestServer(Process process, int port) {
         this.process = process;
         this.port = port;
     }
 
-    int port() {
+    public int port() {
         return port;
     }
 
-    static LocalRedis start() throws IOException {
-        String binary = resolveBinary();
-        assumeTrue(binary != null,
-                "no redis-server binary found; run with -Dmodelgate.test.redis.binary=<path> "
-                        + "to execute the Redis integration tests");
+    public static String hint() {
+        return "no redis-server binary found; run with "
+                + "-Dmodelgate.test.redis.binary=/path/to/redis-server to enable Redis tests";
+    }
 
+    /** @return a running server, or empty when no redis-server binary is available */
+    public static Optional<RedisTestServer> tryStart() {
+        String binary = resolveBinary();
+        if (binary == null) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(startWith(binary));
+        } catch (IOException e) {
+            System.err.println("[testkit] failed to start redis-server: " + e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    private static RedisTestServer startWith(String binary) throws IOException {
         int port = freePort();
         Process process = new ProcessBuilder(binary,
                 "--port", String.valueOf(port),
@@ -54,7 +69,7 @@ final class LocalRedis implements AutoCloseable {
                 .redirectErrorStream(true)
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                 .start();
-        LocalRedis server = new LocalRedis(process, port);
+        RedisTestServer server = new RedisTestServer(process, port);
         server.awaitReady();
         return server;
     }
@@ -95,7 +110,7 @@ final class LocalRedis implements AutoCloseable {
     public void close() {
         process.destroy();
         try {
-            if (!process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+            if (!process.waitFor(5, TimeUnit.SECONDS)) {
                 process.destroyForcibly();
             }
         } catch (InterruptedException e) {
@@ -103,7 +118,7 @@ final class LocalRedis implements AutoCloseable {
         }
     }
 
-    static String resolveBinary() {
+    public static String resolveBinary() {
         String property = System.getProperty("modelgate.test.redis.binary");
         if (isExecutable(property)) {
             return property;

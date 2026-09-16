@@ -14,6 +14,7 @@ import io.modelgate.providers.ProviderRegistry;
 import io.modelgate.router.InProcessRouterState;
 import io.modelgate.router.RouterService;
 import io.modelgate.router.RouterState;
+import io.modelgate.proxy.metrics.MetricsRecorder;
 import io.modelgate.proxy.security.ApiKeyRegistry;
 import io.modelgate.proxy.service.GatewayService;
 
@@ -31,15 +32,23 @@ public class GatewayConfig {
     }
 
     @Bean
-    public RouterService routerService(RouterProperties properties) {
+    public RouterState routerState(RouterProperties properties) {
+        return new InProcessRouterState(
+                properties.getAllowedFails(),
+                properties.getCooldownSeconds(),
+                properties.getFailureWindowSize(),
+                properties.getFailureRateThreshold(),
+                properties.getMinCallsForRate());
+    }
+
+    @Bean
+    public RouterService routerService(RouterProperties properties, RouterState routerState) {
         List<Deployment> deployments = new ArrayList<>();
         properties.getGroups().forEach((group, groupConfig) ->
                 groupConfig.getDeployments().forEach(dc -> deployments.add(new Deployment(
                         dc.getName(), group, dc.getProvider(), dc.getModelId(),
                         dc.getBaseUrl(), dc.getApiKey(), dc.getWeight(), dc.getHeaders()))));
-        RouterState state = new InProcessRouterState(
-                properties.getAllowedFails(), properties.getCooldownSeconds());
-        return new RouterService(deployments, Map.copyOf(properties.getFallbacks()), state);
+        return new RouterService(deployments, Map.copyOf(properties.getFallbacks()), routerState);
     }
 
     @Bean
@@ -48,7 +57,8 @@ public class GatewayConfig {
     }
 
     @Bean
-    public GatewayService gatewayService(RouterService router, LlmClient client) {
-        return new GatewayService(router, client);
+    public GatewayService gatewayService(RouterService router, LlmClient client,
+                                        MetricsRecorder metrics) {
+        return new GatewayService(router, client, metrics);
     }
 }

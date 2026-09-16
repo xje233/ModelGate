@@ -29,6 +29,12 @@
       <groupId>org.springframework</groupId>
       <artifactId>spring-webflux</artifactId>
     </dependency>
+    <!-- spring-webflux declares spring-context as optional, but ReactorClientHttpConnector
+         implements SmartLifecycle: without it the IDE cannot resolve the type hierarchy. -->
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-context</artifactId>
+    </dependency>
     <dependency>
       <groupId>io.projectreactor.netty</groupId>
       <artifactId>reactor-netty-http</artifactId>

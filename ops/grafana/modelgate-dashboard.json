@@ -1,0 +1,200 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "QPS（按 model group）",
+      "description": "rate(modelgate_requests_total[1m])，按对外模型别名聚合",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (model_group) (rate(modelgate_requests_total[1m]))",
+          "legendFormat": "{{model_group}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "端到端延迟 P50 / P95 / P99",
+      "description": "modelgate_request_latency_seconds",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(modelgate_request_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(modelgate_request_latency_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(modelgate_request_latency_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "网关自身开销 P99（端到端 − 上游）",
+      "description": "回答问题“慢是网关慢还是上游慢”的关键面板",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(modelgate_overhead_latency_seconds_bucket[5m])))",
+          "legendFormat": "overhead p99"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(modelgate_overhead_latency_seconds_bucket[5m])))",
+          "legendFormat": "overhead p50"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "流式首 token 延迟 TTFT",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le, provider) (rate(modelgate_ttft_seconds_bucket[5m])))",
+          "legendFormat": "{{provider}} p99"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "语义缓存命中率",
+      "description": "hit / (hit + miss)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": [ "lastNotNull" ] } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(modelgate_cache_hit_total[5m])) / clamp_min(sum(rate(modelgate_cache_lookup_total[5m])), 0.0001)"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "省下的 token / 金额（1h）",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": [ "lastNotNull" ] } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(modelgate_tokens_saved_total[1h]))",
+          "legendFormat": "tokens"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(increase(modelgate_cost_saved_usd_total[1h])) * 1000",
+          "legendFormat": "USD x1000"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "在途请求 / 被合并的请求",
+      "description": "上游变慢时 CPU 不涨但 in_flight 会涨——按 CPU 扩容就会失效",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "modelgate_in_flight", "legendFormat": "in flight" },
+        {
+          "refId": "B",
+          "expr": "sum(rate(modelgate_coalesced_total[5m]))",
+          "legendFormat": "coalesced/s"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "state-timeline",
+      "title": "熔断状态（0 CLOSED / 1 OPEN / 2 HALF_OPEN）",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 22 },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "modelgate_circuit_state",
+          "legendFormat": "{{deployment}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "配额拒绝（按维度）",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (scope) (rate(modelgate_ratelimit_rejected_total[1m]))",
+          "legendFormat": "{{scope}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "错误与降级",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (status) (rate(modelgate_requests_total{status!=\"success\"}[1m]))",
+          "legendFormat": "requests {{status}}"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(modelgate_cache_degraded_total[1m])",
+          "legendFormat": "cache degraded/s"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": [ "modelgate" ],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "ModelGate — 网关总览",
+  "uid": "modelgate-overview",
+  "version": 1
+}

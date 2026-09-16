@@ -20,8 +20,11 @@ import reactor.core.publisher.Mono;
 
 import io.modelgate.client.CostCalculator;
 import io.modelgate.core.ChatRequest;
+import io.modelgate.core.ChatResponse;
 import io.modelgate.providers.json.Json;
 import io.modelgate.proxy.security.ApiKeyIdentity;
+import io.modelgate.proxy.service.CompletionService;
+import io.modelgate.proxy.service.CompletionResult;
 import io.modelgate.proxy.service.GatewayService;
 import io.modelgate.proxy.service.QuotaGuard;
 import io.modelgate.router.RouterService;
@@ -29,20 +32,26 @@ import io.modelgate.router.RouterService;
 /**
  * OpenAI-compatible public endpoint.
  *
- * <p>Order of work per request: authenticate (filter) -> guard (model allow-list + three
- * quota dimensions) -> route -> stream/return -> asynchronously account the tokens.
- * Both response modes are written manually so encoding never depends on content negotiation
+ * <p>Order per request: authenticate (filter) -> guard (allow-list + three quota dimensions)
+ * -> semantic cache probe -> route -> respond -> asynchronously account tokens.
+ * Both response modes are written manually so encoding never depends on content negotiation,
  * and every SSE frame is flushed as soon as it arrives.
+ *
+ * <p>Streaming deliberately bypasses the semantic cache: you cannot know a streamed answer is
+ * a duplicate until it has finished, by which point the tokens are already spent.
  */
 @RestController
 public class ChatController {
 
     private final GatewayService gateway;
+    private final CompletionService completion;
     private final RouterService router;
     private final QuotaGuard guard;
 
-    public ChatController(GatewayService gateway, RouterService router, QuotaGuard guard) {
+    public ChatController(GatewayService gateway, CompletionService completion,
+                          RouterService router, QuotaGuard guard) {
         this.gateway = gateway;
+        this.completion = completion;
         this.router = router;
         this.guard = guard;
     }
@@ -61,12 +70,39 @@ public class ChatController {
                     if (Boolean.TRUE.equals(request.stream())) {
                         return stream(request, response, guarded);
                     }
-                    return blocking(request, response, guarded);
+                    return blocking(request, response, guarded, identity);
+                });
+    }
+
+    private Mono<Void> blocking(ChatRequest request, ServerHttpResponse response,
+                                QuotaGuard.Guarded guarded, ApiKeyIdentity identity) {
+        return completion.complete(request, identity)
+                .flatMap(result -> {
+                    ChatResponse body = result.response();
+                    response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+                    if (result.cacheHit()) {
+                        setHeader(response, "x-modelgate-cache", "hit");
+                        setHeader(response, "x-modelgate-cache-similarity",
+                                String.format("%.4f", result.cacheSimilarity()));
+                        setHeader(response, "x-modelgate-model-id", body.model());
+                    } else {
+                        setHeader(response, "x-modelgate-cache", "miss");
+                        setHeader(response, "x-modelgate-model-id", result.deployment().modelId());
+                        setHeader(response, "x-modelgate-attempted",
+                                String.join(",", result.attempted()));
+                    }
+                    BigDecimal cost = CostCalculator.costUsd(body.model(), body.usage());
+                    if (cost.signum() > 0) {
+                        setHeader(response, "x-modelgate-cost", cost.toPlainString());
+                    }
+                    guard.chargeUsage(guarded, body.usage());
+                    byte[] payload = Json.write(body).getBytes(StandardCharsets.UTF_8);
+                    return response.writeWith(Mono.just(response.bufferFactory().wrap(payload)));
                 });
     }
 
     private Mono<Void> stream(ChatRequest request, ServerHttpResponse response,
-                             QuotaGuard.Guarded guarded) {
+                              QuotaGuard.Guarded guarded) {
         response.getHeaders().setContentType(MediaType.TEXT_EVENT_STREAM);
         DataBufferFactory buffers = response.bufferFactory();
         AtomicBoolean charged = new AtomicBoolean(false);
@@ -82,23 +118,6 @@ public class ChatController {
                 .map(text -> buffers.wrap(text.getBytes(StandardCharsets.UTF_8)));
         // flush after every frame — the whole point of token-level streaming
         return response.writeAndFlushWith(frames.map(Mono::just));
-    }
-
-    private Mono<Void> blocking(ChatRequest request, ServerHttpResponse response,
-                                QuotaGuard.Guarded guarded) {
-        return gateway.chat(request).flatMap(routed -> {
-            response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
-            setHeader(response, "x-modelgate-model-id", routed.deployment().modelId());
-            setHeader(response, "x-modelgate-attempted", String.join(",", routed.attempted()));
-            guard.chargeUsage(guarded, routed.value().usage());
-            BigDecimal cost = CostCalculator.costUsd(
-                    routed.value().model(), routed.value().usage());
-            if (cost.signum() > 0) {
-                setHeader(response, "x-modelgate-cost", cost.toPlainString());
-            }
-            byte[] body = Json.write(routed.value()).getBytes(StandardCharsets.UTF_8);
-            return response.writeWith(Mono.just(response.bufferFactory().wrap(body)));
-        });
     }
 
     @GetMapping("/v1/models")

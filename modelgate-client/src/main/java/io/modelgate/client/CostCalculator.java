@@ -26,7 +26,13 @@ public final class CostCalculator {
             Map.entry("moonshot-v1-8k", new Price(0.14, 0.14)),
             Map.entry("qwen-max", new Price(1.60, 6.40)),
             Map.entry("qwen-plus", new Price(0.40, 1.20)),
-            Map.entry("qwen-turbo", new Price(0.05, 0.20)));
+            Map.entry("qwen-turbo", new Price(0.05, 0.20)),
+            // mock upstreams: priced so cost and cache-savings numbers stay meaningful offline
+            Map.entry("mock-fast-a", new Price(0.15, 0.60)),
+            Map.entry("mock-fast-b", new Price(0.15, 0.60)),
+            Map.entry("mock-smart", new Price(2.50, 10.00)),
+            Map.entry("mock-broken", new Price(0.15, 0.60)),
+            Map.entry("mock-embed", new Price(0.02, 0.00)));
 
     private CostCalculator() {
     }

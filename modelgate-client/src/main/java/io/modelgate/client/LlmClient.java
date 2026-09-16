@@ -14,4 +14,7 @@ public interface LlmClient {
     Mono<ChatResponse> chat(Deployment deployment, ChatRequest request);
 
     Flux<ChatCompletionChunk> chatStream(Deployment deployment, ChatRequest request);
+
+    /** Embedding vector of one text, used by the semantic cache. */
+    Mono<double[]> embed(Deployment deployment, String input);
 }

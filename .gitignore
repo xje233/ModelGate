@@ -1,7 +1,18 @@
 target/
 *.class
-*.log
 .idea/
 *.iml
 .vscode/
 .DS_Store
+
+# 压测原始逐样本数据（单轮 50~200MB）不入库；
+# 汇总(summary-*.txt)与 GC 日志(gc-*.log)是证据，仍入库
+loadtest/raw/*.jtl
+loadtest/raw/*.jtl.gz
+loadtest/raw/proxy-*.log
+loadtest/raw/mock-*.log
+loadtest/raw/redis.log
+loadtest/raw/*-jmeter.log
+
+# 根目录下误落的后台进程日志
+/*.log

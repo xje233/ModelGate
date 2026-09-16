@@ -1,8 +1,14 @@
-# Load-test profile: quotas stay on the hot path but are high enough never to reject,
-# so the numbers measure throughput/latency instead of the 429 path.
+# Load-test profile: quota is switched OFF (unlimited) so the numbers measure the
+# routing/streaming path instead of the 429 path.
 #
 #   java -jar modelgate-proxy.jar --spring.profiles.active=loadtest \
 #        --modelgate.quota.backend=memory|redis
+#
+# Why unlimited instead of "a very high limit": the in-process RPM limiter keeps one
+# timestamp per request inside the sliding window, so a finite limit of e.g. 10M/min would
+# hold ~1.8M deque entries per window and distort both heap usage and the JVM comparison.
+# Quota overhead itself was measured separately in W2 (+1ms p50 for the Redis backend,
+# ~0 for the in-process backend).
 modelgate:
   security:
     keys:
@@ -10,15 +16,15 @@ modelgate:
         id: key-load
         tenant: tenant-load
         models: [ "*" ]
-        rpm: 100000
+        rpm: -1
         tpm: -1
   quota:
     window-seconds: 60
     tenants:
       tenant-load:
-        rpm: 200000
+        rpm: -1
         tpm: -1
     models:
       fast-medium:
-        rpm: 200000
+        rpm: -1
         tpm: -1

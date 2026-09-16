@@ -1,0 +1,22 @@
+# ModelGate + Prometheus 抓取配置
+#
+#   prometheus --config.file=ops/prometheus/prometheus.yml
+#
+# 网关指标在 http://localhost:8080/actuator/prometheus
+# 两个 Mock 上游只在演示故障切换时才需要抓取（它们没有 actuator，默认不抓）。
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: modelgate-proxy
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: [ "host.docker.internal:8080" ]
+        labels:
+          instance_name: gateway
+
+  # 多副本时的写法：每个副本一条 target，指标标签里靠 instance 区分
+  # - job_name: modelgate-proxy
+  #   static_configs:
+  #     - targets: [ "gw-1:8080", "gw-2:8080", "gw-3:8080" ]
