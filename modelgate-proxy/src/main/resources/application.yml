@@ -1,0 +1,60 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: modelgate-proxy
+
+modelgate:
+  security:
+    # W1: static keys. W2: hashed keys in MySQL (t_api_key) with local+Redis cache.
+    api-keys:
+      - sk-local-test-1
+      - sk-local-test-2
+
+  router:
+    allowed-fails: 3
+    cooldown-seconds: 60
+    groups:
+      # fast-medium: 70/30 weighted split across two mock instances
+      fast-medium:
+        deployments:
+          - name: mock-a
+            provider: mock
+            model-id: mock-fast-a
+            base-url: http://127.0.0.1:9001
+            weight: 7
+          - name: mock-b
+            provider: mock
+            model-id: mock-fast-b
+            base-url: http://127.0.0.1:9002
+            weight: 3
+      smart:
+        deployments:
+          - name: mock-smart
+            provider: mock
+            model-id: mock-smart
+            base-url: http://127.0.0.1:9001
+            weight: 5
+      # broken: always answers 500 — exists to demo cooldown + fallback in action
+      broken:
+        deployments:
+          - name: mock-broken
+            provider: mock
+            model-id: mock-broken
+            base-url: http://127.0.0.1:9001
+            headers:
+              x-mock-status: "500"
+            weight: 10
+    fallbacks:
+      broken: [ fast-medium ]
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,info
+
+logging:
+  level:
+    io.modelgate: INFO

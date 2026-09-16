@@ -1,0 +1,15 @@
+spring:
+  application:
+    name: modelgate-mock
+
+mock:
+  name: mock
+  p50-ms: 80
+  ttft-ms: 60
+  chunk-interval-ms: 15
+  reply-chunks: 8
+  error-rate: 0.0
+
+server:
+  # two instances: --server.port=9001 --mock.name=A / --server.port=9002 --mock.name=B
+  port: 9001
