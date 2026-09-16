@@ -1,7 +1,6 @@
 package io.modelgate.proxy.filter;
 
 import java.nio.charset.StandardCharsets;
-import java.util.Set;
 
 import org.springframework.core.annotation.Order;
 import org.springframework.core.io.buffer.DataBuffer;
@@ -15,12 +14,12 @@ import org.springframework.web.server.WebFilterChain;
 
 import reactor.core.publisher.Mono;
 
-import io.modelgate.proxy.config.SecurityProperties;
-import io.modelgate.proxy.controller.ErrorBodies;
+import io.modelgate.proxy.security.ApiKeyIdentity;
+import io.modelgate.proxy.security.ApiKeyRegistry;
 
 /**
- * Bearer-token check for the public API (/v1/**). W1: static key list;
- * W2: hashed keys in MySQL behind a local+Redis cache with in-flight merging.
+ * Bearer-token authentication for the public API (/v1/**). On success the resolved identity
+ * is attached to the exchange so the quota layer and the controller share one lookup.
  */
 @Component
 @Order(-100)
@@ -30,10 +29,10 @@ public class AuthWebFilter implements WebFilter {
             + "\"Missing or invalid API key. Expected header: Authorization: Bearer <key>\","
             + "\"type\":\"auth_error\",\"code\":401}}";
 
-    private final Set<String> apiKeys;
+    private final ApiKeyRegistry registry;
 
-    public AuthWebFilter(SecurityProperties properties) {
-        this.apiKeys = Set.copyOf(properties.getApiKeys());
+    public AuthWebFilter(ApiKeyRegistry registry) {
+        this.registry = registry;
     }
 
     @Override
@@ -42,18 +41,28 @@ public class AuthWebFilter implements WebFilter {
         if (!path.startsWith("/v1/")) {
             return chain.filter(exchange);
         }
-        String auth = exchange.getRequest().getHeaders().getFirst("Authorization");
-        boolean authorized = auth != null
-                && auth.startsWith("Bearer ")
-                && apiKeys.contains(auth.substring(7).trim());
-        if (!authorized) {
-            ServerHttpResponse response = exchange.getResponse();
-            response.setStatusCode(HttpStatus.UNAUTHORIZED);
-            response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
-            DataBuffer buffer = response.bufferFactory()
-                    .wrap(UNAUTHORIZED_BODY.getBytes(StandardCharsets.UTF_8));
-            return response.writeWith(Mono.just(buffer));
+        String token = bearerToken(exchange);
+        ApiKeyIdentity identity = registry.find(token);
+        if (identity == null) {
+            return unauthorized(exchange.getResponse());
         }
+        exchange.getAttributes().put(ApiKeyIdentity.ATTRIBUTE, identity);
         return chain.filter(exchange);
+    }
+
+    private static String bearerToken(ServerWebExchange exchange) {
+        String auth = exchange.getRequest().getHeaders().getFirst("Authorization");
+        if (auth == null || !auth.startsWith("Bearer ")) {
+            return null;
+        }
+        return auth.substring(7).trim();
+    }
+
+    private static Mono<Void> unauthorized(ServerHttpResponse response) {
+        response.setStatusCode(HttpStatus.UNAUTHORIZED);
+        response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+        DataBuffer buffer = response.bufferFactory()
+                .wrap(UNAUTHORIZED_BODY.getBytes(StandardCharsets.UTF_8));
+        return response.writeWith(Mono.just(buffer));
     }
 }

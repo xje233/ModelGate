@@ -4,13 +4,59 @@ server:
 spring:
   application:
     name: modelgate-proxy
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      timeout: 2000ms
 
 modelgate:
   security:
-    # W1: static keys. W2: hashed keys in MySQL (t_api_key) with local+Redis cache.
-    api-keys:
-      - sk-local-test-1
-      - sk-local-test-2
+    # W2: keys in config. Later: t_api_key in MySQL (SHA-256 hashed token) behind the same lookup.
+    keys:
+      - value: sk-local-test-1
+        id: key-a
+        tenant: tenant-a
+        models: [ fast-medium, smart, broken ]
+        rpm: 60
+        tpm: 100000
+      - value: sk-local-test-2
+        id: key-b
+        tenant: tenant-b
+        models: [ "*" ]
+        rpm: 600
+        tpm: 2000000
+
+  quota:
+    # memory = single instance (no Redis needed) | redis = shared counters for a cluster
+    backend: memory
+    window-seconds: 60
+    default-key:
+      rpm: 600
+      tpm: 2000000
+    default-tenant:
+      rpm: 3000
+      tpm: 10000000
+    default-model:
+      rpm: -1
+      tpm: -1
+    tenants:
+      tenant-a:
+        rpm: 300
+        tpm: 500000
+      tenant-b:
+        rpm: 3000
+        tpm: 10000000
+    models:
+      fast-medium:
+        rpm: 1000
+        tpm: 2000000
+      smart:
+        rpm: 500
+        tpm: 1000000
+      broken:
+        rpm: 1000
+        tpm: 2000000
 
   router:
     allowed-fails: 3
@@ -54,6 +100,10 @@ management:
     web:
       exposure:
         include: health,prometheus,info
+  health:
+    # redis backend is opt-in; keep the health check quiet in memory mode
+    redis:
+      enabled: false
 
 logging:
   level:

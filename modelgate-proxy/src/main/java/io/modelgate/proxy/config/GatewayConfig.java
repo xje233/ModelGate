@@ -14,10 +14,16 @@ import io.modelgate.providers.ProviderRegistry;
 import io.modelgate.router.InProcessRouterState;
 import io.modelgate.router.RouterService;
 import io.modelgate.router.RouterState;
+import io.modelgate.proxy.security.ApiKeyRegistry;
 import io.modelgate.proxy.service.GatewayService;
 
 @Configuration
 public class GatewayConfig {
+
+    @Bean
+    public ApiKeyRegistry apiKeyRegistry(SecurityProperties security, QuotaProperties quota) {
+        return new ApiKeyRegistry(security, quota);
+    }
 
     @Bean
     public ProviderRegistry providerRegistry() {

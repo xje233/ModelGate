@@ -1,0 +1,24 @@
+# Load-test profile: quotas stay on the hot path but are high enough never to reject,
+# so the numbers measure throughput/latency instead of the 429 path.
+#
+#   java -jar modelgate-proxy.jar --spring.profiles.active=loadtest \
+#        --modelgate.quota.backend=memory|redis
+modelgate:
+  security:
+    keys:
+      - value: sk-load-test
+        id: key-load
+        tenant: tenant-load
+        models: [ "*" ]
+        rpm: 100000
+        tpm: -1
+  quota:
+    window-seconds: 60
+    tenants:
+      tenant-load:
+        rpm: 200000
+        tpm: -1
+    models:
+      fast-medium:
+        rpm: 200000
+        tpm: -1

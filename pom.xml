@@ -22,6 +22,7 @@
     <module>modelgate-core</module>
     <module>modelgate-providers</module>
     <module>modelgate-router</module>
+    <module>modelgate-quota</module>
     <module>modelgate-client</module>
     <module>modelgate-mock</module>
     <module>modelgate-proxy</module>
