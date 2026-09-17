@@ -283,6 +283,36 @@ ModelGate
 | 分周功能验证记录 | [W3](verify/W3-verification.md) · [W4](verify/W4-verification.md) |
 | 面试话术与交底 | [docs/interview-narrative.md](docs/interview-narrative.md) |
 
+## 参考实现
+
+ModelGate 的设计不是凭空来的。它会做这个形态，是因为先读了三个开源项目：
+
+| 项目 | 技术栈 | 贡献了什么 |
+| :--- | :--- | :--- |
+| [BerriAI/litellm](https://github.com/BerriAI/litellm) | Python + Rust | **事实标准与术语来源**：model group vs deployment、retry / fallback / cooldown 三者的区分、virtual key、级联预算、dual cache、in-flight 请求合并、`overhead_latency`、TTFT |
+| [yonglun/java-litellm](https://github.com/yonglun/java-litellm) | Java 21 + Spring Boot 3 | **Java 栈的分层与工程骨架**（LiteLLM 开源部分的 Java 重写）：`core → providers → client → router → proxy` 单向依赖、canonical 类型作为全系统唯一数据契约、Provider SPI 扩展、同一接口下的 in-process / Redis 双实现 |
+| [zouyee/llmlite](https://github.com/zouyee/llmlite) | Zig | 熔断的 `CLOSED / OPEN / HALF_OPEN` 状态机、P50/P95/P99 延迟跟踪，以及 `/metrics` **按上游维度打标**的思路 |
+
+这些参考点具体落在哪：
+
+| 参考点 | 在 ModelGate 里的形态 |
+| :--- | :--- |
+| 五层单向依赖 | `modelgate-core` / `-providers` / `-client` / `-router` / `-proxy`；另拆出 `quota` / `cache` / `usage` 三块，它们只依赖 `core` |
+| core 作为唯一数据契约 | 所有上游的请求与响应都归一到 `modelgate-core` 的 OpenAI 格式类型，避免"每个 Provider 一套 DTO 到处转换" |
+| Provider SPI | 新增一家上游 = 多一个实现，不动核心代码 |
+| 一个接口两套后端 | 配额、缓存、路由状态都是「进程内 / Redis」两套实现共用一个接口——同时解决"本地零依赖能跑"与"多副本能共用状态" |
+| 概念区分落到代码 | retry（组内换部署）/ fallback（跨组）/ cooldown（摘单个部署）是三条独立路径，不是一坨重试 |
+| 指标按维度打标 | `modelgate_*` 指标带 `model_group` / `provider` / `stream` / `deployment` 等标签，上游劣化时能直接定位到是哪一个 |
+
+### 没有照搬的部分
+
+- **不做管理门户 UI**：LiteLLM 有一个功能完整的 `/ui/`（虚拟密钥、团队、消费看板）。这里把观测交给 Grafana、控制面交给 `/admin/**` API——网关的交付面是接口与指标，不是页面。
+- **不做运行时动态配置**：LiteLLM 的 `config.yaml` 支持热重载，这里用 Spring profile + 环境变量，配置变更即重建实例——换取"任何一份运行配置都能在 Git 里被 review"。
+- **并发模型换了一条路**：不做 Python 的 asyncio 单事件循环，流式透传走 Reactor / WebFlux，靠背压而不是"把 worker 数堆高"来控制内存。
+
+> `java-litellm` 仓库最近从旧名 `Vincent-Ye/java-litellm` 改过名，旧地址会 301 重定向；
+> 上面写的是当前地址。
+
 ## License
 
 本项目基于 [MIT License](LICENSE) 开源。
