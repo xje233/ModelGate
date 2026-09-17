@@ -1,29 +1,21 @@
-# ModelGate
+<div align="center">
+  <h2>ModelGate</h2>
 
-面向大模型调用的统一接入与流量治理网关：多模型路由 / 灰度分流 / 多维配额 / 语义缓存 /
-熔断降级 / 用量与成本核算。
+</div>
 
-- 实施计划：[plan.md](plan.md)
-- 压测报告：[W2](loadtest/RESULTS.md) · [W3（JVM 对照）](loadtest/RESULTS-W3.md)
-- 功能验证：[W3](verify/W3-verification.md) · [W4](verify/W4-verification.md)
-- 面试话术：[docs/interview-narrative.md](docs/interview-narrative.md)
+<div align="center">
 
-## 模块
+面向大模型调用的 <strong>统一接入与流量治理网关</strong>。
 
-```
-modelgate-core        canonical OpenAI 格式类型（零依赖，全系统唯一数据契约）
-modelgate-providers   Provider SPI + OpenAI 兼容泛化实现（chat + embeddings）
-modelgate-router      加权路由 / 灰度分桶 / retry(组内) / fallback(跨组) / 熔断状态机
-modelgate-quota       三层配额（key / tenant / model）：进程内 与 Redis+Lua 双后端
-modelgate-cache       语义缓存：余弦检索 + 进程内/Redis 双后端 + 嵌入缓存 + in-flight 合并
-modelgate-usage       用量与成本：有界队列 + 异步批量落库 + 多维聚合
-modelgate-client      WebClient 传输 + SSE 解析 + 超时归一 + 成本/缓存计价
-modelgate-mock        Mock 上游（延迟 / 逐帧 pacing / 注错 / 确定性 embedding / 模拟 prompt cache）
-modelgate-proxy       Spring Boot WebFlux 网关（对外交付形态）
-modelgate-testkit     测试基建（一次性 redis-server 等）
-```
+把一个 OpenAI 兼容入口作为所有模型调用的唯一出口，由网关统一承担
+多模型路由、灰度分流、多维配额、语义缓存、熔断降级与用量成本核算。
 
-## 架构与请求链路
+</div>
+
+## 项目概览
+
+客户端与上游模型之间多了一层网关，对外只暴露 OpenAI 兼容协议——因此任何支持自定义
+`base_url` 的客户端或框架都能直接接进来，不需要改代码。
 
 ```mermaid
 flowchart LR
@@ -51,247 +43,246 @@ flowchart LR
     GW --> AD[/admin/usage/]
 ```
 
-一次非流式请求的顺序：**鉴权 → 配额三层校验 → 定臂 → 语义缓存探测 → 路由（retry/fallback/熔断）
-→ 写响应 → 异步记账**。流式请求跳过缓存（要等答案全部生成才知道重复，那时 token 已经花了），
-逐帧 flush 透传。
-
-依赖方向是单向的：`core ← providers ← client ← proxy`，`router`/`quota`/`cache`/`usage` 只依赖 `core`，
-所以路由、配额、缓存、计量四块逻辑都能脱离 HTTP 单独单测。
-
-## 构建与运行
+网关没有界面，它的「界面」是响应头与指标：**每个响应都自带这次调用的路由、缓存、成本信息**，
+不需要翻日志就能解释一个请求到底发生了什么。
 
 ```bash
-# 用项目自带 settings：全局 settings.xml 的 localRepository 指向 Windows 路径、
-# 且镜像是 http 会被 Maven 3.9 拦截（详见 maven-settings.xml 内注释）
-# 用 install 而非 package：模块间依赖要先落到本地仓库，IDE 才能解析
+$ curl -s localhost:8080/v1/chat/completions -D - \
+    -H "Authorization: Bearer sk-local-test-1" -H "Content-Type: application/json" \
+    -d '{"model":"broken","messages":[{"role":"user","content":"hi"}]}'
+
+HTTP/1.1 200 OK
+x-modelgate-model-id: mock-fast-b
+x-modelgate-attempted: mock-broken,mock-b     ← broken 组必返 500，已自动跨组降级
+x-modelgate-cache: miss
+x-modelgate-cost: 0.000009
+x-modelgate-arm: single
+{"id":"chatcmpl-mock-3145ed56","model":"mock-fast-b","choices":[...],"usage":{...}}
+```
+
+## 核心功能
+
+模型调用的成本、延迟与上游稳定性都不由网关决定，但**能不能被观测、被约束、被降级**由网关决定。
+四层能力都围绕这一点展开。
+
+### 🚦 统一入口与多模型路由
+
+> 业务只需要认模型别名，上游怎么扩容、怎么换厂商都与调用方无关。
+
+- **OpenAI 兼容协议** — `/v1/chat/completions`（流式 / 非流式）与 `/v1/models`；Provider SPI 让新增上游只是多一个实现。
+- **别名 → deployment 两层结构** — `fast-medium` 是业务别名，下面可以挂多个真实部署（不同厂商 / 不同实例），按权重选路。
+- **三层语义分离** — retry（组内换部署）/ fallback（跨组）/ cooldown（摘掉单个部署）是**三件不同的事**，不是一坨重试。
+- **流式透传与背压** — SSE 逐帧 flush，不缓冲整个响应；流式 failover 只发生在**首个 chunk 之前**。
+
+### 🛡️ 分层流量治理
+
+> 上游会抖、调用方会超量，网关要在它们影响到业务之前拦住。
+
+- **三层配额** — key / tenant / model 三个维度，RPM 走滑动窗口、TPM 按真实用量记账；Redis 场景下三维由**一个 Lua 脚本原子校验**。
+- **熔断** — `CLOSED → OPEN → HALF_OPEN` 状态机，双信号触发（连续失败 **或** 窗口失败率），冷却时间指数退避。
+- **降级可追溯** — 每个响应回 `x-modelgate-attempted`，完整失败链一眼可见，不用去猜"这次到底走了哪条路"。
+- **拒绝也是协议** — 429 带 `Retry-After` 与 `x-ratelimit-scope`，调用方能自己退避，而不是盲目重试。
+
+### 💰 成本与命中率
+
+> 大模型调用是少见的"降低成本靠改代码"的成本项：同样的答案没有理由付两次钱。
+
+- **语义缓存** — 请求 Embedding 做余弦检索，命中直接返回；按调用方隔离 namespace；in-flight 合并防冷缓存击穿。
+- **用量收据** — 每次请求落一条（token / 缓存命中 / 路由臂 / 尝试链 / TTFT / 成本）；热路径只入有界队列，异步批量写库。
+- **成本按真实计价** — prompt cache 的命中与写入倍率不同（OpenAI 0.5× / 2×，Anthropic 双边 1.25×），在网关层解析 `prompt_tokens_details` 后计价。
+- **灰度可归因** — 按调用方哈希分桶，同一调用方永远落同一臂；用量表按 `ARM` 维度聚合，实验数据能直接比对基线。
+
+### 🔭 可观测与可验证
+
+> 网关类项目最容易糊弄过去的地方：数字从哪来、量的是哪条路径。
+
+- **15 类指标** — 包含 `overhead_latency`（端到端 − 上游 = 网关自身开销）、`ttft`（首 token 延迟）、`in_flight`、`circuit_state`。
+- **Grafana 面板随环境自动加载** — 由 provisioning 注入，不需要手工导入 JSON。
+- **Mock 上游** — 可控延迟、逐帧 pacing、注错、确定性 embedding；压测数字能说清口径，也解释了为什么它们不与厂商公开基准比较。
+- **JVM 对照实验** — G1 vs ZGC 在 P99 长尾上的差异，堆外内存单独观测（Reactor Netty 的 ByteBuf 不在堆上）。
+
+## 系统流程
+
+一次非流式请求的完整链路，包含缓存命中与上游失败两条分支：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as OpenAI 兼容客户端
+    participant GW as 网关 WebFlux
+    participant Q as 配额 Redis+Lua
+    participant SC as 语义缓存
+    participant R as Router
+    participant UP as 上游 deployment
+    participant UD as 用量队列
+
+    C->>GW: POST /v1/chat/completions (Bearer sk-...)
+    GW->>GW: 鉴权 + 身份解析（key → tenant）
+    GW->>Q: key → tenant → model 三维校验
+    alt 超出配额
+        Q-->>C: 429 + Retry-After + x-ratelimit-scope
+    end
+
+    GW->>GW: 灰度定臂（canary / stable，按调用方哈希）
+    GW->>SC: 语义相似度探测
+    alt 缓存命中
+        SC-->>C: 直接返回（记账省下的 token 与金额）
+    end
+
+    GW->>R: 选路（加权 / 灰度）
+    R-->>GW: 候选 deployment 链
+    GW->>UP: 转发（流式则逐帧透传）
+    alt 上游失败
+        UP-->>GW: 5xx / 超时 / 连接失败
+        GW->>R: 组内 retry → 跨组 fallback
+        R-->>GW: 备用 deployment
+        GW->>UP: 重试
+    end
+    UP-->>GW: 响应
+
+    GW-->>C: 响应 + x-modelgate-* 响应头
+    GW->>UD: 异步记账（不阻塞响应）
+```
+
+## 技术栈
+
+| 层次 | 技术 | 用途 |
+| :--- | :--- | :--- |
+| 运行时 | Java 21、Spring Boot 3.5.6、Maven 多模块 | 网关主体与模块化边界 |
+| Web | Spring WebFlux（Reactor Netty）、SSE | OpenAI 兼容入口、流式逐帧透传与背压 |
+| 治理 | 自研 `router` / `quota` / `cache` / `usage` | 加权路由、灰度分桶、熔断、三层配额、语义缓存 |
+| 存储 | Redis 7（Lua 脚本）、H2 / MySQL 8 | 共享配额与缓存、用量落库（同一套 SQL） |
+| 观测 | Micrometer、Prometheus、Grafana | 15 类指标与看板 |
+| 压测 | JMeter、自建 Mock 上游 | QPS / P99 / 错误率与 JVM 对照 |
+| 部署 | Docker、Docker Compose | 一键起整套环境（`observability` / `loadtest` 两个可选 profile） |
+
+## 本地运行
+
+### 环境要求
+
+| 组件 | 要求 | 说明 |
+| :--- | :--- | :--- |
+| JDK | 21 | 宿主机直跑时需要 |
+| Maven | 3.9+ | 构建。**必须带 `-s maven-settings.xml`**，原因见常见问题 |
+| Docker | Compose v2 | 可选。用它就不需要本机装 JDK / Redis |
+| Redis | 7 | 可选。只有 `backend: redis` 或容器 `docker` profile 才需要 |
+| JMeter | 5.6.3 | 可选。压测时需要 |
+
+### 方式一：Docker Compose（推荐）
+
+本机不需要装 JDK、Redis，全部组件在容器里：
+
+```bash
+docker compose up -d --build                     # redis + mock-a + mock-b + 网关
+docker compose --profile observability up -d     # 再加 Prometheus(9090) + Grafana(3000)
+```
+
+网关监听 `8080`。容器运行与宿主机直跑**共用同一份路由配置**（上游地址是环境变量占位符），
+完整说明、已知边界与实测记录见 [docker/README.md](docker/README.md)。
+
+### 方式二：宿主机直跑
+
+默认走内存后端，不依赖 Redis：
+
+```bash
 mvn -s maven-settings.xml clean install
 
 java -jar modelgate-mock/target/modelgate-mock-*.jar --server.port=9001 --mock.name=A
 java -jar modelgate-mock/target/modelgate-mock-*.jar --server.port=9002 --mock.name=B
 java -jar modelgate-proxy/target/modelgate-proxy-*.jar
+```
 
-# 非流式
-curl -s localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-local-test-1" -H "Content-Type: application/json" \
+### 快速验证
+
+下面几个请求分别验证入口、失败降级、语义缓存与流式透传：
+
+```bash
+U=http://127.0.0.1:8080/v1/chat/completions
+H='Authorization: Bearer sk-local-test-1'
+CT='Content-Type: application/json'
+
+# 1. 基本调用：看响应头就知道路由到哪个上游、花了多少钱
+curl -s $U -H "$H" -H "$CT" -D - \
   -d '{"model":"fast-medium","messages":[{"role":"user","content":"hi"}]}'
 
+# 2. 失败降级：broken 组必返 500，观察 x-modelgate-attempted 的完整失败链
+curl -s $U -H "$H" -H "$CT" -D - \
+  -d '{"model":"broken","messages":[{"role":"user","content":"hi"}]}'
+
+# 3. 语义缓存：这条命令连跑两次，第二次拿到 x-modelgate-cache: hit + 相似度
+curl -s $U -H "$H" -H "$CT" -D - \
+  -d '{"model":"fast-medium","messages":[{"role":"user","content":"cache me"}]}'
+
 # 流式（SSE 逐帧透传）
-curl -sN localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-local-test-1" -H "Content-Type: application/json" \
-  -H "Accept: text/event-stream" \
+curl -sN $U -H "$H" -H "$CT" -H 'Accept: text/event-stream' \
   -d '{"model":"fast-medium","stream":true,"messages":[{"role":"user","content":"hi"}]}'
-
-# 故障演练：broken 组强制 500，验证跨组 fallback
-curl -s localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-local-test-1" -H "Content-Type: application/json" \
-  -d '{"model":"broken","messages":[{"role":"user","content":"hi"}]}' -D -
-# 响应头 x-modelgate-attempted: mock-broken,mock-b 显示完整失败链
 ```
 
-整个环境（网关 + 两个 Mock + Redis）也可以一键起容器，本机不需要装 JDK / Redis：
+可用别名：`fast-medium`（两实例 7:3 加权）、`smart`、`broken`（恒 500，用于演练降级）、`ab-test`（灰度）。
+演示密钥：`sk-local-test-1`（限模型、60 rpm）、`sk-local-test-2`（`*`、600 rpm）。
 
-```bash
-docker compose up -d --build                     # redis + mock-a + mock-b + proxy
-docker compose --profile observability up -d     # 再加 Prometheus + Grafana（面板自动加载）
+### 常见问题
+
+| 现象 | 处理方式 |
+| :--- | :--- |
+| IDE 整片报红、`Missing artifact io.modelgate:...` | 新模块必须先 `mvn -s maven-settings.xml clean install`（`package` 不够），再让 IDE 重新导入 Maven 工程。详见[实现细节](docs/implementation.md)第 11 节 |
+| Maven 报 `maven-default-http-blocker`，或依赖被装进项目目录 | 必须带 `-s maven-settings.xml`：全局 settings 的 `localRepository` 指向 Windows 路径、镜像是 http |
+| `401 Missing or invalid API key` | 检查 `Authorization: Bearer sk-local-test-1`；`loadtest` profile 下演示密钥会失效，该 profile 只认 `sk-load-test` |
+| `403 key 'xxx' is not allowed to use model 'yyy'` | 该 key 的 `models` 白名单不含这个模型（`sk-local-test-2` 是 `*`） |
+| `429 Too Many Requests` | 配额生效，看 `x-ratelimit-scope` 与 `Retry-After`；`sk-local-test-1` 只有 60 rpm |
+| 压测全是 401、QPS 虚高到几千 | 没激活 `loadtest` profile——`sk-load-test` 这个密钥只定义在 `application-loadtest.yml` 里 |
+| 压测 QPS 异常高，或权重看起来全落一个上游 | 固定 prompt 命中了语义缓存，量到的是缓存路径。见[实现细节](docs/implementation.md)第 9 节 |
+| 容器内压测报 `NoRouteToHostException` | 压测器在 bridge 网络的连接上限；`jmeter` 服务已配 host 网络，用 `--no-deps` 跑 |
+
+## 目录结构
+
+```text
+ModelGate
+├── modelgate-core/        # canonical OpenAI 格式类型（零依赖，全系统唯一数据契约）
+├── modelgate-providers/   # Provider SPI + OpenAI 兼容泛化实现
+├── modelgate-router/      # 加权路由 / 灰度分桶 / retry / fallback / 熔断状态机
+├── modelgate-quota/       # 三层配额（进程内 + Redis+Lua 双后端）
+├── modelgate-cache/       # 语义缓存（余弦检索 + in-flight 合并）
+├── modelgate-usage/       # 用量与成本（有界队列 + 异步批量落库 + 多维聚合）
+├── modelgate-client/      # 传输层：WebClient + SSE 解析 + 超时归一 + 计价
+├── modelgate-proxy/       # 对外网关（Spring Boot WebFlux）
+├── modelgate-mock/        # Mock 上游（压测与故障演练）
+├── modelgate-testkit/     # 测试基建
+├── docker/                # 容器化配置与运行手册
+├── loadtest/              # JMeter 计划、汇总脚本与压测报告
+├── ops/                   # Prometheus 抓取配置、Grafana 面板、生产 DDL
+├── verify/                # 分周功能验证记录
+├── docs/                  # 实现细节与面试话术
+├── Dockerfile             # 多阶段构建：proxy / mock 两个运行时 target
+└── docker-compose.yml     # redis + mock×2 + 网关（含 observability / loadtest profile）
 ```
 
-宿主直跑与容器运行**共用同一份路由配置**（上游地址走占位符 `${MODELGATE_MOCK_A_URL:...}`），
-差别只是环境变量。已知边界、压测口径与实测记录见 [docker/README.md](docker/README.md)。
+## 已知边界
 
-## IDE 报红怎么办（先看这里）
+这些是**有意留下**的边界，不打算用"看起来完整"来掩盖：
 
-现象：`Missing artifact io.modelgate:modelgate-xxx:jar:0.1.0-SNAPSHOT`、`Maven Dependencies
-references non existing library ...`，随后整片 `cannot be resolved`。
+- **上游是 Mock**：Provider SPI 与 OpenAI 兼容实现是真的，但演示链路不接真实厂商。
+  所有 QPS / P99 都注明上游为 Mock 及机器规格，不与厂商公开基准做比较。
+- **熔断状态是进程内的**：多副本各看各的。`RouterState` 接口已抽好，Redis 实现照
+  `modelgate-quota` 的模式补即可。
+- **MySQL 控制面未接线**：身份与路由目前仍由 `application.yml` 承担，
+  `t_tenant` / `t_api_key` / `t_model` 的 DDL 已就位；用量落库已接通（本地 H2，生产同一套 SQL）。
+- **不做管理后台 UI**：观测走 Grafana，控制面走 `/admin/**` API。网关的交付面是
+  OpenAI 兼容接口 + Prometheus 指标，不是页面。
+- **不做 100+ Provider**：3~4 家 + OpenAI 兼容协议泛化接入，覆盖绝大多数上游。
 
-原因：**IDE 是按本地仓库解析模块间依赖的**。当新增了一个模块（比如 W2 的 `modelgate-quota`、
-W3 的 `modelgate-cache` / `modelgate-testkit`），在它被 `install` 到本地仓库、且 IDE 重新导入
-Maven 工程之前，IDE 会一直抱着"这个 jar 不存在"的旧结论并级联报红。
+## 文档索引
 
-处置（两步）：
+| 想了解 | 看 |
+| :--- | :--- |
+| 机制怎么实现、有哪些开关、实测结论 | [docs/implementation.md](docs/implementation.md) |
+| 实施计划与排期 | [plan.md](plan.md) |
+| 容器化与它的坑 | [docker/README.md](docker/README.md) |
+| 指标清单与 Grafana 面板 | [ops/README.md](ops/README.md) |
+| 压测报告 | [W2](loadtest/RESULTS.md) · [W3（JVM 对照）](loadtest/RESULTS-W3.md) |
+| 分周功能验证记录 | [W3](verify/W3-verification.md) · [W4](verify/W4-verification.md) |
+| 面试话术与交底 | [docs/interview-narrative.md](docs/interview-narrative.md) |
 
-```bash
-# 1. 让依赖真正落到本地仓库（package 不够，必须是 install）
-mvn -s maven-settings.xml clean install
+## License
 
-# 2. 让 IDE 重新解析
-#    IntelliJ IDEA：Maven 面板 → 🔄 Reload All Maven Projects（必要时再 Build → Rebuild Project）
-#    Eclipse / m2e：项目右键 → Maven → Update Project（Alt+F5），勾选 Force Update
-```
-
-判断"到底是代码问题还是 IDE 缓存问题"，用这条命令即可：
-**不带 `-am`、纯离线**地单独构建某个模块，它能过就说明本地仓库解析链路是通的。
-
-```bash
-mvn -s maven-settings.xml -o -pl modelgate-proxy clean package -DskipTests
-```
-
-## 路由与熔断
-
-| 机制 | 范围 | 触发 |
-|---|---|---|
-| retry | model group 内换 deployment | 5xx / 429 / 连接失败 / 超时（4xx 不重试，也不计入熔断） |
-| fallback | 跨 group（按 `modelgate.router.fallbacks` 顺序） | 当前组全部失败 |
-| 熔断 | 单个 deployment | 连续失败 ≥ `allowed-fails` **或** 窗口内失败率 ≥ `failure-rate-threshold` |
-
-熔断状态机：`CLOSED → OPEN →(冷却到期) HALF_OPEN →(探测成功) CLOSED / (探测失败) OPEN`。
-冷却时间随连续熔断**指数退避**（1× → 2× → 3×，上限 10×）。
-两个触发信号缺一不可：连续失败抓硬故障，失败率抓"轮流失败"的抖动上游。
-
-流式请求的 failover 只发生在**首个 chunk 之前**——已有字节到达客户端就不再重试，否则会重复输出。
-
-## 灰度分流（canary / A-B）
-
-按**调用方（API key）哈希分桶**决定臂，同一调用方永远落在同一臂——否则灰度期间用户会在两个变体之间
-来回跳，数据既无法归因也会被用户察觉。响应头回 `x-modelgate-arm`，用量表里也记臂。
-
-```yaml
-modelgate:
-  router:
-    groups:
-      ab-test:
-        canary-deployment: mock-ab-canary   # 实验臂由哪个 deployment 承载
-        canary-percentage: 30               # 30% 的调用方
-        deployments:
-          - { name: mock-ab-stable, model-id: mock-fast-a, base-url: http://127.0.0.1:9001, weight: 10 }
-          - { name: mock-ab-canary, model-id: mock-fast-b, base-url: http://127.0.0.1:9002, weight: 10 }
-```
-
-stable 臂不会给 canary 部署分流量；canary 部署被熔断时，连实验臂的调用方也会回落到稳定池。
-
-⚠️ **分桶必须做哈希雪崩**：`String.hashCode()` 对顺序发放的 id（`key-a`、`key-b`…）是连续值，
-直接取模会让整批调用方一起进同一臂（实测 `key-a`..`key-s` 在 30% 阈值下占 73%）。
-实现里先过一遍 MurmurHash3 的 32 位 finalizer，仍保持跨 JVM / 跨副本确定。
-
-## 语义缓存
-
-```
-请求 → 嵌入向量（按 prompt 哈希缓存，命中则零开销）
-     → 在 namespace 内做余弦检索
-         命中 → 直接返回，记账省下的 token 与金额
-         未命中 → 走上游 → 异步回填缓存
-```
-
-- **namespace = `sc:{keyId}:{modelGroup}:{paramsHash}`**：key 是隔离边界的一部分，
-  一个调用方的答案不会泄露给另一个调用方；把 key 去掉就是安全事故。
-- **阈值默认 0.95**：只吃"同一问题 + 标点/空白差异"；0.85 能命中改述，但有答非所问风险
-  （用 `modelgate_cache_similarity` 的分布来决定该往哪边调）。
-- **in-flight 合并**：冷缓存瞬间的 N 个相同请求只打一次上游，其余共享结果——
-  压测里 30s 内合并掉 149 万次请求。
-- **缓存永不阻断请求**：嵌入/检索任何异常都降级为正常上游调用，并累加 `cache_degraded_total`。
-- **流式不查缓存**：流式答案要等全部生成完才知道是不是重复，那时 token 已经花掉了。
-
-```yaml
-modelgate:
-  cache:
-    enabled: true
-    backend: memory        # memory = 单实例；redis = 多副本共享
-    similarity-threshold: 0.95
-    embedding-deployment: mock-embed   # 承接 embedding 的 deployment 名
-    coalescing-enabled: true
-```
-
-## 三层配额
-
-维度与检查顺序：**key → tenant → model**（最具体者先拦）。RPM 走滑动窗口，TPM 按真实 usage
-在调用完成后异步记账。Redis 场景下三个维度由**一个 Lua 脚本原子校验**（1 次 RTT 而非 3 次）。
-超限返回 `429` + `Retry-After` + `x-ratelimit-scope`。
-
-```yaml
-modelgate:
-  quota:
-    backend: memory     # memory = 单实例；redis = 多实例共享计数
-```
-
-## 用量与成本
-
-每次请求落一条收据（requestId / key / tenant / 模型 / token / 缓存命中 / 路由臂 / 尝试链 /
-TTFT / 成本）。热路径只做一次 `offer` 入有界队列，后台线程批量写库：
-**一个慢的数据库永远不能让一次推理变慢**，代价是账单最终一致、队列打满会丢记录——
-所以 `dropped`（服务了但没收到钱）是最该告警的指标。
-
-```yaml
-modelgate:
-  usage:
-    backend: memory        # memory | jdbc
-    queue-capacity: 20000  # 打满即丢，绝不阻塞请求
-    batch-size: 500
-    flush-interval-millis: 1000
-```
-
-成本不能简单按 tokens × 单价：**prompt cache 的命中与写入倍率不同**（OpenAI 命中 0.5×、写入 2×；
-Anthropic 两边 1.25×），所以 `usage.prompt_tokens_details` 在网关层解析并计价——
-实测同一段 ~1000 token 的 prompt，命中 90% 的臂成本 `0.000097`，另一臂 `0.000164`。
-
-```bash
-# 按维度聚合：DATE / TENANT / MODEL / KEY / ARM（ARM = 灰度归因）
-curl -s "localhost:8080/admin/usage?dimension=ARM&from=2026-09-16&to=2026-09-16" \
-  -H "Authorization: Bearer sk-local-test-1"
-curl -s localhost:8080/admin/usage/stats -H "Authorization: Bearer sk-local-test-1"
-
-# jdbc 后端（本地用 H2，同一套 SQL；生产换 MySQL 的 URL/驱动即可）
-java -jar modelgate-proxy-*.jar --modelgate.usage.backend=jdbc \
-  --spring.sql.init.mode=always \
-  --spring.sql.init.schema-locations=classpath:db/schema-h2.sql
-```
-
-生产 DDL（含 `t_tenant` / `t_api_key` / `t_model` 控制面）见 [ops/sql/schema.sql](ops/sql/schema.sql)。
-
-## 可观测性
-
-指标清单、Prometheus 抓取配置与 Grafana 面板见 [ops/README.md](ops/README.md)。
-最关键的两个：`modelgate_overhead_latency`（端到端 − 上游，即网关自身开销）与
-`modelgate_circuit_state`（0 CLOSED / 1 OPEN / 2 HALF_OPEN）。
-
-```bash
-curl -s localhost:8080/actuator/prometheus | grep ^modelgate_ | sort
-```
-
-## 压测
-
-```bash
-# 负载 profile（配额关闭，见 profile 内注释）
-java -jar modelgate-proxy/target/modelgate-proxy-*.jar --spring.profiles.active=loadtest
-
-jmeter -n -t loadtest/modelgate-chat.jmx \
-  -Jhost=127.0.0.1 -Jport=8080 -JapiKey=sk-load-test \
-  -Jthreads=100 -Jramp=5 -Jduration=30 -Jjtl=/tmp/gateway.jtl
-loadtest/stats.sh /tmp/gateway.jtl      # 输出 QPS / P50 / P95 / P99 / 错误率
-```
-
-容器里的等效跑法（`docker,loadtest` 双 profile 与 `--no-deps` 都是必须的，
-理由见 [docker/README.md](docker/README.md) 4.1）：
-
-```bash
-SPRING_PROFILES_ACTIVE=docker,loadtest docker compose up -d proxy
-MODELGATE_CACHE_ENABLED=false docker compose --profile loadtest run --rm --no-deps jmeter
-```
-
-⚠️ 上面这个 JMeter 计划**每次迭代发的是同一个 prompt**。想量"上游转发路径"就必须
-`MODELGATE_CACHE_ENABLED=false`，否则第 2 次起全部命中语义缓存，量到的是缓存路径
-（实测 219 QPS vs 6175 QPS，同样都是 0% 错误）。同理，验证**权重分布**时也要每个请求换
-prompt，否则数到的是缓存里那条响应的模型名——会把 7:3 显示成 100:0。
-
-实测结论（详见 [loadtest/RESULTS-W3.md](loadtest/RESULTS-W3.md)）：
-
-| 轮次 | 配置 | QPS | P99 | 最长 GC 暂停 |
-|---|---|---|---|---|
-| R1 | 默认 JVM | 13,126 | 21ms | 30.7ms |
-| R2 | G1 + 固定堆 2g / 堆外 1g | 13,865 | 18ms | 27.3ms |
-| R3 | ZGC + 固定堆 2g / 堆外 1g | 14,764 | 14ms | **0.1ms** |
-| R4 | G1 + 语义缓存开启 | **53,790** | **9ms** | 19.1ms |
-
-- **换 GC 换不来吞吐**（13.1k~14.8k 属同机噪声，ZGC 两次跑出 11.6k / 14.8k），
-  但**暂停时间差 108 倍**（ZGC 总暂停 2.6ms vs G1 281.8ms），直接反映在 P99 上。
-- 目前收益最大的单项是语义缓存：吞吐 3.9×，P50 从 6ms 降到 1ms。
-
-## 响应头
-
-| 头 | 含义 |
-|---|---|
-| `x-modelgate-model-id` | 实际命中的上游模型 |
-| `x-modelgate-attempted` | 完整尝试链 |
-| `x-modelgate-cost` | 本次调用成本（USD，按价目表计算） |
-| `x-modelgate-cache` / `x-modelgate-cache-similarity` | `hit` / `miss` 与相似度 |
-| `x-modelgate-arm` | 本次请求的路由臂：`canary` / `stable` / `single` |
-| `x-ratelimit-remaining-requests` | 当前窗口剩余请求数 |
-| `Retry-After` / `x-ratelimit-scope` | 仅 429 时出现 |
+本项目基于 [MIT License](LICENSE) 开源。
