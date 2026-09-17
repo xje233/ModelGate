@@ -1,0 +1,27 @@
+# Build-context hygiene. The Maven build needs: every pom.xml, every src/, and
+# maven-settings.xml. Everything else is dead weight that also invalidates the
+# layer cache on every unrelated edit.
+
+.git
+.gitignore
+.idea
+.vscode
+.DS_Store
+
+# build output — rebuilt inside the image
+**/target
+
+# local run logs and load-test artefacts (the jmeter service bind-mounts these
+# at runtime; they never need to be baked into an image)
+logs
+loadtest/raw
+**/*.log
+**/*.jtl
+**/*.tar.gz
+
+# docs and verification notes: useful to humans, useless to the build
+docs
+verify
+README.md
+plan.md
+LICENSE

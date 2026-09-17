@@ -107,25 +107,30 @@ modelgate:
     failure-rate-threshold: 0.5
     min-calls-for-rate: 10
     groups:
+      # The two mock instances are addressed through placeholders so this one file
+      # works both on the host (127.0.0.1 defaults) and inside compose, where the
+      # mocks are reached by service name instead:
+      #   MODELGATE_MOCK_A_URL=http://mock-a:9001  MODELGATE_MOCK_B_URL=http://mock-b:9002
+      #
       # fast-medium: 70/30 weighted split across two mock instances
       fast-medium:
         deployments:
           - name: mock-a
             provider: mock
             model-id: mock-fast-a
-            base-url: http://127.0.0.1:9001
+            base-url: ${MODELGATE_MOCK_A_URL:http://127.0.0.1:9001}
             weight: 7
           - name: mock-b
             provider: mock
             model-id: mock-fast-b
-            base-url: http://127.0.0.1:9002
+            base-url: ${MODELGATE_MOCK_B_URL:http://127.0.0.1:9002}
             weight: 3
       smart:
         deployments:
           - name: mock-smart
             provider: mock
             model-id: mock-smart
-            base-url: http://127.0.0.1:9001
+            base-url: ${MODELGATE_MOCK_A_URL:http://127.0.0.1:9001}
             weight: 5
       # ab-test: 灰度分流演示。按调用方（API key）哈希分桶，30% 落到 canary 臂，
       # 同一个 key 永远落在同一臂（否则实验数据没法和基线比）
@@ -136,12 +141,12 @@ modelgate:
           - name: mock-ab-stable
             provider: mock
             model-id: mock-fast-a
-            base-url: http://127.0.0.1:9001
+            base-url: ${MODELGATE_MOCK_A_URL:http://127.0.0.1:9001}
             weight: 10
           - name: mock-ab-canary
             provider: mock
             model-id: mock-fast-b
-            base-url: http://127.0.0.1:9002
+            base-url: ${MODELGATE_MOCK_B_URL:http://127.0.0.1:9002}
             weight: 10
       # embeddings: 语义缓存的向量来源（mock 提供确定性的哈希 bigram 向量）
       embeddings:
@@ -149,7 +154,7 @@ modelgate:
           - name: mock-embed
             provider: mock
             model-id: mock-embed
-            base-url: http://127.0.0.1:9001
+            base-url: ${MODELGATE_MOCK_A_URL:http://127.0.0.1:9001}
             weight: 1
       # broken: always answers 500 — exists to demo cooldown + fallback in action
       broken:
@@ -157,7 +162,7 @@ modelgate:
           - name: mock-broken
             provider: mock
             model-id: mock-broken
-            base-url: http://127.0.0.1:9001
+            base-url: ${MODELGATE_MOCK_A_URL:http://127.0.0.1:9001}
             headers:
               x-mock-status: "500"
             weight: 10

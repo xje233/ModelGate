@@ -154,8 +154,12 @@ SSE 透传、压测、P99、JVM、GC 暂停、堆外内存。
 
 - **单机 vs 集群**：熔断状态目前是进程内的，多副本各看各的；配额和语义缓存已经做成"进程内 / Redis 双后端"，
   熔断照同样的接口加一套 Redis 实现即可（接口已抽好）。
-- **`modelgate-testkit`、`ops/` 下的 Grafana 面板**：面板是按真实指标写的，但本机没有 Docker，
-  **没有经过渲染验证**——我只验证了 `/actuator/prometheus` 的指标导出。
+- **Grafana 面板已渲染验证**（2026-09-17 补齐）：本机 Docker 可用后，用
+  `docker compose --profile observability up -d` 实跑——Prometheus 抓 `proxy:8080` 状态 `up`，
+  数据源（uid `prometheus`）与面板（`modelgate-overview`「ModelGate — 网关总览」）由
+  provisioning 自动加载。**原先"面板写了但没渲染过"这句兜底话已作废，别再用了。**
+- **`modelgate-testkit`** 仍是测试辅助（依赖本机 redis 二进制），不在容器内跑；
+  `modelgate-testkit` 与 `docker/` 里的构建阶段都跳测，容器不是证明正确性的地方。
 - **上游是 Mock**：所有 QPS/P99 都注明上游为 Mock 及机器规格，不与厂商公开基准做比较。
 - **MySQL 控制面**：DDL 已就位（`ops/sql/schema.sql`），用量落库已接通；
   离线 SQL 验证跑在 H2（MySQL 模式）上，`t_api_key` 的接线留作下一步。

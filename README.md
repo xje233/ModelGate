@@ -88,6 +88,16 @@ curl -s localhost:8080/v1/chat/completions \
 # 响应头 x-modelgate-attempted: mock-broken,mock-b 显示完整失败链
 ```
 
+整个环境（网关 + 两个 Mock + Redis）也可以一键起容器，本机不需要装 JDK / Redis：
+
+```bash
+docker compose up -d --build                     # redis + mock-a + mock-b + proxy
+docker compose --profile observability up -d     # 再加 Prometheus + Grafana（面板自动加载）
+```
+
+宿主直跑与容器运行**共用同一份路由配置**（上游地址走占位符 `${MODELGATE_MOCK_A_URL:...}`），
+差别只是环境变量。已知边界、压测口径与实测记录见 [docker/README.md](docker/README.md)。
+
 ## IDE 报红怎么办（先看这里）
 
 现象：`Missing artifact io.modelgate:modelgate-xxx:jar:0.1.0-SNAPSHOT`、`Maven Dependencies
@@ -247,6 +257,19 @@ jmeter -n -t loadtest/modelgate-chat.jmx \
   -Jthreads=100 -Jramp=5 -Jduration=30 -Jjtl=/tmp/gateway.jtl
 loadtest/stats.sh /tmp/gateway.jtl      # 输出 QPS / P50 / P95 / P99 / 错误率
 ```
+
+容器里的等效跑法（`docker,loadtest` 双 profile 与 `--no-deps` 都是必须的，
+理由见 [docker/README.md](docker/README.md) 4.1）：
+
+```bash
+SPRING_PROFILES_ACTIVE=docker,loadtest docker compose up -d proxy
+MODELGATE_CACHE_ENABLED=false docker compose --profile loadtest run --rm --no-deps jmeter
+```
+
+⚠️ 上面这个 JMeter 计划**每次迭代发的是同一个 prompt**。想量"上游转发路径"就必须
+`MODELGATE_CACHE_ENABLED=false`，否则第 2 次起全部命中语义缓存，量到的是缓存路径
+（实测 219 QPS vs 6175 QPS，同样都是 0% 错误）。同理，验证**权重分布**时也要每个请求换
+prompt，否则数到的是缓存里那条响应的模型名——会把 7:3 显示成 100:0。
 
 实测结论（详见 [loadtest/RESULTS-W3.md](loadtest/RESULTS-W3.md)）：
 

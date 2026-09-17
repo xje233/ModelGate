@@ -1,0 +1,207 @@
+# ModelGate — the whole environment, one command.
+#
+#   docker compose up -d --build              redis + mock-a + mock-b + gateway
+#   docker compose --profile observability up -d      + Prometheus + Grafana
+#   docker compose --profile loadtest run --rm jmeter JMeter against the gateway
+#
+# The gateway reaches the mocks by service name (MODELGATE_MOCK_A_URL), so no
+# host networking and no 127.0.0.1 leakage: the same compose file works on a
+# laptop, in CI and on a server.
+#
+# Not included on purpose: MySQL. The gateway runs on H2 in-memory and the MySQL
+# path (ops/sql/schema.sql) additionally needs com.mysql:mysql-connector-j on the
+# classpath, which is a project change rather than an environment one. See
+# docker/README.md for the exact steps if you want it.
+
+name: modelgate
+
+# JVM flags shared by the Spring Boot containers.
+#
+# GC logging goes to stdout on purpose: `docker compose logs proxy > gc.log` is
+# the entire extraction step, and it keeps the images free of any need to write
+# to a host directory (which a non-root container cannot create anyway).
+#
+# MaxDirectMemorySize is not decoration: Reactor Netty buffers incoming and
+# outgoing payloads off-heap, so on a streaming gateway the heap graph alone
+# misjudges where the memory went.
+x-jvm-tuning: &jvm-tuning >-
+  -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError
+  -Xms256m -Xmx256m -XX:MaxDirectMemorySize=128m -Xlog:gc
+
+# Latency/error knobs of the two mock upstreams. Overriding them is how the
+# load-test gradient in loadtest/RESULTS.md was produced, e.g.
+#   MOCK_P50_MS=200 docker compose up -d mock-a
+x-mock-env: &mock-env
+  MOCK_P50_MS: "${MOCK_P50_MS:-80}"
+  MOCK_TTFT_MS: "${MOCK_TTFT_MS:-60}"
+  MOCK_CHUNK_INTERVAL_MS: "${MOCK_CHUNK_INTERVAL_MS:-15}"
+  MOCK_ERROR_RATE: "${MOCK_ERROR_RATE:-0.0}"
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    # noeviction is deliberate. With allkeys-lru an evicted quota counter would
+    # silently hand a tenant free traffic; the cache keys carry their own TTL, so
+    # they expire without needing an eviction policy to save them.
+    command: >
+      redis-server --save "" --appendonly no
+      --maxmemory 256mb --maxmemory-policy noeviction
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  mock-a:
+    build:
+      context: .
+      target: mock
+    image: modelgate-mock:0.1.0
+    environment:
+      <<: *mock-env
+      SERVER_PORT: "9001"
+      # Shows up in the reply text, so you can see which upstream answered
+      MOCK_NAME: "A"
+      JAVA_OPTS: "-XX:+ExitOnOutOfMemoryError -Xms128m -Xmx128m"
+    ports:
+      - "9001:9001"
+
+  mock-b:
+    build:
+      context: .
+      target: mock
+    image: modelgate-mock:0.1.0
+    environment:
+      <<: *mock-env
+      SERVER_PORT: "9002"
+      MOCK_NAME: "B"
+      JAVA_OPTS: "-XX:+ExitOnOutOfMemoryError -Xms128m -Xmx128m"
+    ports:
+      - "9002:9002"
+
+  proxy:
+    build:
+      context: .
+      target: proxy
+    image: modelgate-proxy:0.1.0
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-a:
+        condition: service_healthy
+      mock-b:
+        condition: service_healthy
+    environment:
+      # Profile list. Add "loadtest" for throughput runs — that profile is what
+      # defines the sk-load-test key the JMeter plan sends and what makes quota
+      # unlimited, matching the methodology in loadtest/RESULTS*.md:
+      #   SPRING_PROFILES_ACTIVE=docker,loadtest docker compose up -d proxy
+      # Without it every JMeter iteration gets a 401.
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-docker}
+      # Upstreams by service name (picked up by application.yml placeholders)
+      MODELGATE_MOCK_A_URL: http://mock-a:9001
+      MODELGATE_MOCK_B_URL: http://mock-b:9002
+      MODELGATE_REDIS_HOST: redis
+      # Every switch documented in docker/README.md has to be listed here:
+      # compose forwards only the variables named in this block, so an env var
+      # that is not mentioned is silently dropped instead of reaching Spring.
+      MODELGATE_QUOTA_BACKEND: ${MODELGATE_QUOTA_BACKEND:-redis}
+      MODELGATE_CACHE_BACKEND: ${MODELGATE_CACHE_BACKEND:-redis}
+      MODELGATE_USAGE_BACKEND: ${MODELGATE_USAGE_BACKEND:-memory}
+      MODELGATE_CACHE_ENABLED: ${MODELGATE_CACHE_ENABLED:-true}
+      JAVA_OPTS: *jvm-tuning
+      # MODELGATE_USAGE_BACKEND=jdbc additionally needs:
+      #   SPRING_SQL_INIT_MODE=always
+      #   SPRING_SQL_INIT_SCHEMA_LOCATIONS=classpath:db/schema-h2.sql
+    ports:
+      - "8080:8080"
+
+  # ── optional: observability ────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: [observability]
+    volumes:
+      # compose-network variant of ops/prometheus/prometheus.yml, which targets
+      # host.docker.internal because there the gateway runs outside Docker.
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles: [observability]
+    depends_on:
+      - prometheus
+    environment:
+      # Anonymous viewer access: the dashboard is meant to be opened, not logged into.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+    volumes:
+      # Provisioned rather than clicked: datasource + dashboard load on boot, so
+      # the panel is reproducible instead of "works on my Grafana".
+      - ./docker/grafana/datasource.yml:/etc/grafana/provisioning/datasources/modelgate.yml:ro
+      - ./docker/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/modelgate.yml:ro
+      - ./ops/grafana/modelgate-dashboard.json:/etc/grafana/provisioning/dashboards/modelgate-dashboard.json:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
+  # ── optional: load test ────────────────────────────────────────────────────
+  #
+  # Run it with --no-deps so the generator cannot touch the system under test:
+  #   docker compose --profile loadtest run --rm --no-deps jmeter
+  # Without --no-deps, `run` reconciles the dependencies first and silently
+  # recreates the gateway from docker-compose.yml — which resets the profile and
+  # the backend switches you started it with (measured: every request then got a
+  # 401 because the sk-load-test key only exists under the loadtest profile).
+  jmeter:
+    # The image the reports in loadtest/ were produced with. If your registry
+    # mirror refuses it (docker.xuanyuan.me answers 403), justb4/jmeter works for
+    # checking the wiring — but it ships JMeter 5.1.1 on **Java 8**, so its numbers
+    # are not comparable with the reports. Say which image produced a number.
+    #   JMETER_IMAGE=justb4/jmeter:5.1.1 docker compose --profile loadtest run --rm --no-deps jmeter
+    image: ${JMETER_IMAGE:-apache/jmeter:5.6.3}
+    profiles: [loadtest]
+    depends_on:
+      proxy:
+        condition: service_healthy
+    # Host networking is not a convenience here, it is the difference between a
+    # measurement and a network artefact. On the compose bridge the generator tops
+    # out around 3.2k req/s and then dies with NoRouteToHostException (connection
+    # churn exhausting the Docker network stack), while the gateway is innocent —
+    # its logs show zero exceptions, and the same run over host networking does
+    # 7.7k req/s with 0% errors:
+    #   bridge : 3215 req/s, p99 88ms, 56% NoRouteToHostException
+    #   host   : 7730 req/s, p99  7ms,  0% errors
+    # So throughput numbers must come from here. The gateway is reachable at
+    # 127.0.0.1 because compose publishes 8080 on the host.
+    network_mode: host
+    volumes:
+      - ./loadtest:/loadtest
+    # -J params are what modelgate-chat.jmx reads via __P(). The same plan also
+    # drives the baseline that bypasses the gateway: -Jhost=127.0.0.1 -Jport=9001
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      # rm -f rather than `jmeter -f`: -f only clears the file named by -l, while
+      # the plan carries its own ResultCollector, so a second run would otherwise
+      # be appended to the first and the summary would describe two experiments.
+      - >
+        rm -f /loadtest/raw/docker-gateway.jtl &&
+        jmeter -n -t /loadtest/modelgate-chat.jmx
+        -Jhost=127.0.0.1 -Jport=8080 -JapiKey=sk-load-test
+        -Jthreads=${JMETER_THREADS:-50}
+        -Jramp=${JMETER_RAMP:-5}
+        -Jduration=${JMETER_DURATION:-30}
+        -Jjtl=/loadtest/raw/docker-gateway.jtl
+
+volumes:
+  prometheus-data:
+  grafana-data:

@@ -14,5 +14,8 @@ loadtest/raw/mock-*.log
 loadtest/raw/redis.log
 loadtest/raw/*-jmeter.log
 
-# 根目录下误落的后台进程日志
+# 临时进程日志（本地起网关/上游/JMeter 时产生）不入库：
+#   /*.log —— 误落在仓库根目录的
+#   logs/  —— 统一收拢目录
 /*.log
+logs/

@@ -1,0 +1,19 @@
+# Grafana dashboard provisioning.
+#
+# Points at the same directory the dashboard JSON is mounted into, so
+# ops/grafana/modelgate-dashboard.json loads on boot without any clicking. This
+# is what turns "the panel JSON was written but never rendered" into something
+# that actually renders.
+apiVersion: 1
+
+providers:
+  - name: modelgate
+    orgId: 1
+    folder: ModelGate
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

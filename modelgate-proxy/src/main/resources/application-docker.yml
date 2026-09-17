@@ -1,0 +1,49 @@
+# ── docker / compose profile ─────────────────────────────────────────────────
+# Activated by SPRING_PROFILES_ACTIVE=docker (see docker-compose.yml).
+#
+# Only the things that genuinely differ inside a container network live here:
+#   1. Redis is a real service instead of "not running on this laptop"
+#   2. therefore the shared-state backends become the sensible default
+#
+# Upstream addresses are NOT here — application.yml already reads them from
+# MODELGATE_MOCK_A_URL / MODELGATE_MOCK_B_URL, so the host run and the compose
+# run share one router definition.
+#
+# Anything below can be overridden from the environment, e.g.
+#   MODELGATE_QUOTA_BACKEND=memory docker compose up -d proxy
+
+spring:
+  data:
+    redis:
+      host: ${MODELGATE_REDIS_HOST:redis}
+      port: ${MODELGATE_REDIS_PORT:6379}
+
+modelgate:
+  quota:
+    # Shared counters. Two gateway replicas must observe the same sliding window;
+    # the in-process limiter would give each replica its own full budget.
+    backend: ${MODELGATE_QUOTA_BACKEND:redis}
+
+  cache:
+    # Shared semantic cache: a hit on replica A has to be visible to replica B for
+    # the "cache hit rate" number to mean anything in a cluster.
+    backend: ${MODELGATE_CACHE_BACKEND:redis}
+
+  usage:
+    # memory = in-process ring buffer (zero dependency, dies with the container)
+    # jdbc   = batch insert into t_usage_log; needs the schema loaded first:
+    #            MODELGATE_USAGE_BACKEND=jdbc
+    #            SPRING_SQL_INIT_MODE=always
+    #            SPRING_SQL_INIT_SCHEMA_LOCATIONS=classpath:db/schema-h2.sql
+    backend: ${MODELGATE_USAGE_BACKEND:memory}
+
+management:
+  health:
+    # In this profile Redis is a hard dependency, so let /actuator/health report it.
+    # The base file disables it because the memory backends need no Redis at all.
+    redis:
+      enabled: ${MODELGATE_REDIS_HEALTH:true}
+
+logging:
+  level:
+    io.modelgate: INFO

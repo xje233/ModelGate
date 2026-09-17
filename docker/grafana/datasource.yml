@@ -1,0 +1,18 @@
+# Grafana datasource provisioning.
+#
+# The uid is pinned to "prometheus" because ops/grafana/modelgate-dashboard.json
+# references the datasource by that uid. Renaming it here silently breaks every
+# panel in the imported dashboard, so keep the two in sync.
+apiVersion: 1
+
+datasources:
+  - name: prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # Matches Prometheus' scrape_interval; also what the dashboard's
+      # rate() windows assume.
+      timeInterval: 5s

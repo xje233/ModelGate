@@ -1,0 +1,25 @@
+# Prometheus scrape config for the compose network.
+#
+# The host-side file (ops/prometheus/prometheus.yml) targets
+# host.docker.internal:8080 because there Prometheus runs in a container while the
+# gateway runs on the host. Here both live on the same compose network, so the
+# gateway is simply reachable by its service name.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: modelgate-proxy
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: [ "proxy:8080" ]
+        labels:
+          instance_name: gateway
+
+  # Scale-out shape: one target per replica, distinguished by the instance label.
+  # The gateway itself is stateless once quota/cache live in Redis, so this is
+  # only about where the samples come from.
+  # - job_name: modelgate-proxy
+  #   static_configs:
+  #     - targets: [ "proxy-1:8080", "proxy-2:8080" ]
